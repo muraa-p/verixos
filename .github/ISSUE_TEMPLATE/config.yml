@@ -1,0 +1,20 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ask a question
+    url: https://github.com/verixos/verixos/discussions
+    about: Usage, configuration, and "how do I do X" questions. Open a discussion rather than an issue.
+  - name: Design discussion
+    url: https://github.com/verixos/verixos/discussions
+    about: Proposals, alternatives, and anything that should change ARCHITECTURE.md. Please read ARCHITECTURE.md first.
+  - name: Report a security vulnerability
+    url: https://github.com/verixos/verixos/security/advisories/new
+    about: Report privately via GitHub Security Advisories. Please do not open a public issue for a vulnerability.
+  - name: Report a bug
+    url: https://github.com/verixos/verixos/issues/new/choose
+    about: Use the bug report template. Please include the full console output and the exact command.
+  - name: Request a feature
+    url: https://github.com/verixos/verixos/issues/new/choose
+    about: Use the feature request template.
+  - name: Code of conduct
+    url: https://github.com/verixos/verixos/blob/main/CODE_OF_CONDUCT.md
+    about: Reports of unacceptable conduct, and how enforcement works in this project.

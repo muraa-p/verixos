@@ -1,0 +1,25 @@
+# Build output
+/dist/
+/images/
+*.tsbuildinfo
+
+# Dependencies
+/node_modules/
+
+# Runtime artifacts
+/logs/
+*.log
+*.core
+/crash/
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+
+# Local simulation recordings
+/recordings/

@@ -1,0 +1,109 @@
+name: Feature request
+description: Suggest a capability or a change to an existing subsystem
+title: "[Feature]: "
+labels:
+  - enhancement
+  - needs triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting this.
+
+        VerixOS is pre-1.0 and the design is still moving, so design discussion is
+        genuinely useful here — a well-argued proposal that argues against a
+        feature is just as welcome as one that adds it.
+
+        If your suggestion touches the memory map, the syscall ABI, the driver
+        model or the VFS interface, please read `ARCHITECTURE.md` first, and say
+        in the proposal which of those contracts it affects. Changes to those are
+        expected to update the corresponding document in the same pull request.
+
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Which area does this affect?
+      options:
+        - Machine model
+        - Boot path
+        - Memory management
+        - Interrupts or exceptions
+        - Drivers
+        - Scheduler or process model
+        - VFS or filesystem
+        - Syscalls
+        - Userland (shell or desktop)
+        - Tooling, tests or CI
+        - Documentation
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: >
+        Describe the problem, not the solution. It is much easier to agree on a
+        fix once the problem is written down independently of any particular
+        implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What have you considered instead?
+      description: Including doing nothing, if that is genuinely an option.
+    validations:
+      required: true
+
+  - type: textarea
+    id: architectural-impact
+    attributes:
+      label: Architectural impact
+      description: >
+        Does this change a documented contract: the physical memory map, the
+        syscall ABI, the native code boundary, the driver model, or the VFS
+        operations table? If so, which, and how would the documentation change?
+    validations:
+      required: false
+
+  - type: textarea
+    id: roadmap-fit
+    attributes:
+      label: Where does this fit in the roadmap?
+      description: Which phase in `docs/roadmap.md` does this belong to, if any?
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: willing
+    attributes:
+      label: Contribution
+      options:
+        - label: I would be willing to implement this
+        - label: I would be willing to review a pull request for this
+        - label: I am suggesting this for discussion only
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints
+      description: Confirm you are working within the project's constraints.
+      options:
+        - label: >
+            This can be done without adding a runtime dependency
+          required: true
+        - label: >
+            This can be done without requiring a toolchain beyond Node.js and git
+          required: true
+        - label: This does not require claiming VerixOS runs on bare metal
+          required: true

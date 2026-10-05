@@ -1,0 +1,168 @@
+name: Bug report
+description: Something in VerixOS does not behave as documented
+title: "[Bug]: "
+labels:
+  - bug
+  - needs triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this.
+
+        VerixOS is early-stage software, so reports are genuinely useful. If you
+        are reporting a machine model bug rather than a kernel bug, please say so:
+        those matter more than usual here, because the machine model is what the
+        kernel is being reasoned about against.
+
+  - type: checkboxes
+    id: prerequisites
+    attributes:
+      label: Before you submit
+      options:
+        - label: I have read the Limitations section of the README
+          required: true
+        - label: This is not a duplicate of an existing issue
+          required: true
+        - label: I am using the latest `main`
+          required: true
+
+  - type: input
+    id: kernel-version
+    attributes:
+      label: VerixOS version
+      description: From the startup banner, or `git describe --tags`.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: host-node-version
+    attributes:
+      label: Host Node.js version
+      description: Output of `node --version` on your machine.
+      placeholder: "v24.0.0"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Host operating system
+      placeholder: Ubuntu 24.04
+    validations:
+      required: true
+
+  - type: textarea
+    id: exact-command
+    attributes:
+      label: Exact command run
+      description: The command exactly as typed, including all flags.
+      render: shell
+      placeholder: npm start -- boot --smoke
+    validations:
+      required: true
+
+  - type: textarea
+    id: console-output
+    attributes:
+      label: Full console output
+      description: >
+        The complete output, in a code block. Please do not paste a screenshot,
+        and please do not trim the output — the lines around a failure are usually
+        the interesting ones. If the output is long, a trimmed excerpt with the
+        first and last failure visible is better than nothing.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: tests-pass
+    attributes:
+      label: Does the test suite pass on this checkout?
+      description: Output of `npm test`, or the error if it does not run.
+      render: shell
+      placeholder: "# fail 0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: tests-status
+    attributes:
+      label: Test suite result
+      options:
+        - All tests pass
+        - Some tests fail
+        - The test suite does not run
+    validations:
+      required: true
+
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Which layer is the problem in?
+      description: Your best guess is fine.
+      options:
+        - Machine model (registers, decoder, buses, devices)
+        - Boot path (boot sector, stage 2, long mode transition)
+        - Memory management (PMM, VMM, heap)
+        - Interrupts or exceptions
+        - Drivers
+        - Scheduler or process model
+        - VFS or filesystem
+        - Syscalls
+        - Userland (shell or desktop)
+        - Tooling, tests or CI
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: sdm-behaviour
+    attributes:
+      label: Is the wrong behaviour one the Intel SDM specifies?
+      description: >
+        If the correct behaviour is defined architecturally, an SDM reference is
+        the single most useful thing you can add.
+      options:
+        - Yes, and I know the relevant section
+        - Yes, but I do not know the section
+        - No, this is a design or preference issue
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: sdm-reference
+    attributes:
+      label: SDM reference
+      description: "Volume, section and table, for example: Intel SDM Vol. 3, Sec. 4.5, Table 4-7."
+      placeholder: Intel SDM Vol. 3, Sec. 4.5
+    validations:
+      required: false
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Numbered, starting from a fresh checkout.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Anything else?
+      description: >
+        Configuration, recent changes, or anything else that seems relevant. If
+        this is a regression, please say which release or commit worked.
+    validations:
+      required: false
