@@ -98,12 +98,42 @@ describe('decoder: no-operand instructions', () => {
 });
 
 describe('decoder: MOV', () => {
-  it('decodes mov rax, imm64', () => {
-    const insn = decode64([0x48, 0xb8, 1, 2, 3, 4, 5, 6, 7, 8]);
+  it('decodes mov r64, imm32 - there is no imm64 form of B8', () => {
+    // B8+rd has exactly two forms: without REX.W it is `mov r32, imm32`, and with
+    // REX.W it is `mov r/m64, imm32` *sign-extended*. There is no eight-byte immediate
+    // for this opcode, so reading eight bytes here would swallow the four bytes of the
+    // next instruction and report a length that is four too long. The register is 64
+    // bits wide and the immediate is 32, and conflating those is exactly the mistake.
+    const insn = decode64([0x48, 0xb8, 1, 2, 3, 4]);
     assert.equal(insn.mnemonic, Mnemonic.MOV);
-    assert.deepEqual(insn.operands[0], { kind: 'reg', reg: Reg.AX });
-    assert.equal(insn.operands[1]?.kind, 'imm');
-    if (insn.operands[1]?.kind === 'imm') assert.equal(insn.operands[1].value, 0x0807_0605_0403_0201n);
+    assert.equal(insn.length, 6);
+    assert.equal(insn.operandSize, 64);
+    assert.deepEqual(insn.operands[0], { kind: 'reg', reg: Reg.AX, size: 64 });
+    assert.deepEqual(insn.operands[1], { kind: 'imm', value: 0x0403_0201n, width: 32 });
+
+    // Sign extension, which is the whole content of the W bit on this opcode: an imm32
+    // with the top bit set fills the upper half of the destination. Little-endian, so
+    // `fe ff ff ff` is the imm32 0xfffffffe - writing `ff ff ff fe` here would be
+    // 0xfeffffff, which has a different sign bit position entirely.
+    const negative = decode64([0x48, 0xb8, 0xfe, 0xff, 0xff, 0xff]);
+    assert.equal(negative.length, 6);
+    assert.deepEqual(negative.operands[1], { kind: 'imm', value: -2n, width: 32 });
+
+    // The same opcode without REX.W writes 32 bits and is therefore unsigned: the very
+    // same four immediate bytes mean 0xfffffffe there, not -2.
+    const unsigned = decode64([0xb8, 0xfe, 0xff, 0xff, 0xff]);
+    assert.equal(unsigned.length, 5);
+    assert.equal(unsigned.operandSize, 32);
+    assert.deepEqual(unsigned.operands[0], { kind: 'reg', reg: Reg.AX, size: 32 });
+    assert.deepEqual(unsigned.operands[1], { kind: 'imm', value: 0xfffffffen, width: 32 });
+
+    // There is no 64-bit immediate move anywhere in the architecture, so the assembler
+    // refuses `mov rax, 0x1122...` rather than inventing an encoding. The C7 /0 form
+    // also takes a 32-bit immediate, sign-extended - seven bytes, not eleven - and a
+    // full 64-bit constant has to come from memory.
+    const c7 = decode64([0x48, 0xc7, 0xc0, 0x88, 0x77, 0x66, 0x55]);
+    assert.equal(c7.length, 7);
+    assert.deepEqual(c7.operands[1], { kind: 'imm', value: 0x5566_7788n, width: 32 });
   });
 
   it('zero-extends a 32-bit immediate into the register encoding', () => {
@@ -267,7 +297,7 @@ describe('decoder: addressing modes', () => {
     if (insn.operands[1]?.kind === 'mem') {
       assert.equal(insn.operands[1].base, Reg.BX);
       assert.equal(insn.operands[1].index, Reg.SI);
-      assert.equal(insn.operands[1].sizeOverride, '16');
+      assert.equal(insn.operands[1].addressWidth, 16);
     }
   });
 
@@ -446,13 +476,18 @@ describe('decoder: sequential decode over a byte stream', () => {
       0x48, 0xc7, 0xc7, 0x00, 0x00, 0x00, 0x00, // mov rdi, 0
       0x0f, 0x1f, 0x40, 0x00, // nop dword [rax]
       0x65, 0x48, 0x8b, 0x04, 0x25, 0x78, 0x56, 0x34, 0x12, // mov rax, fs:[0x12345678]
-      0xf3, 0xab, // rep stosq
+      0xf3, 0xab, // rep stosd - the 0xF3 supplies no width, so the default applies
       0x48, 0x0f, 0xaf, 0xc1, // imul rax, rcx
       0x0f, 0x84, 0x0a, 0x00, 0x00, 0x00, // je +0xa
     ]);
     assert.match(lines[0]!, /^xor rax, rax/);
-    assert.match(lines[4]!, /^mov rax, \[0x12345678\]/);
-    assert.match(lines[5]!, /^stos/);
+    // The size keyword is not optional: without it `mov rax, [0x12345678]` is ambiguous,
+    // and this assembler refuses ambiguous memory operands rather than guessing.
+    assert.match(lines[4]!, /^mov rax, qword \[0x12345678\]/);
+    // `f3 ab` has no REX.W, so the default operand size applies and this is `stosd`,
+    // not the 64-bit `stosq` the comment in the fixture claims. A4/AB/AC/AE pair
+    // A5/AD/AF by opcode, and the *wide* member of the pair is the 32-bit one here.
+    assert.match(lines[5]!, /^rep stosd/);
     assert.match(lines[7]!, /^je 0x401030/);
   });
 
@@ -460,20 +495,39 @@ describe('decoder: sequential decode over a byte stream', () => {
     // f3 ab = rep stosq, the canonical memset idiom. Dropping the prefix would
     // turn it into a single store.
     const insn = decode64([0xf3, 0xab]);
-    assert.equal(insn.mnemonic, Mnemonic.STOS);
+    assert.equal(insn.mnemonic, Mnemonic.STOSD);
+    assert.equal(insn.stringWidth, 32);
     assert.equal(insn.rep, 'rep');
     assert.equal(insn.length, 2);
+    // And the prefix reaches the text, which is what makes it re-assemblable.
+    assert.match(insn.toString(), /^rep stosd/);
+
+    // REX.W is what makes it the 64-bit form: `48 a5` is movsq and `f3 48 ab` is
+    // rep stosq. Reading the width off `operandSize` alone gets 32 here, because
+    // long mode's *default* operand size is 32 and the byte opcode A4 overrides it
+    // only in the other direction.
+    assert.equal(decode64([0xf3, 0x48, 0xab]).mnemonic, Mnemonic.STOSQ);
+    assert.equal(decode64([0xf3, 0x48, 0xab]).stringWidth, 64);
+    assert.equal(decode64([0xf3, 0x66, 0xab]).mnemonic, Mnemonic.STOSW);
+    assert.equal(decode64([0xf3, 0xaa]).mnemonic, Mnemonic.STOSB);
   });
 
   it('spells conditional jumps and sets as the assembler does', () => {
-    // "jcce" and "sete" are map names, not mnemonics. Any assembler consuming
-    // this disassembly has to see je and setz.
+    // "jcce" and "setcce" are map names, not mnemonics. Any assembler consuming this
+    // disassembly has to see je and sete.
     const jcc = decode64([0x0f, 0x84, 0x00, 0x00, 0x00, 0x00]);
     assert.match(jcc.toString(), /^je /);
     const setcc = decode64([0x0f, 0x94, 0xc0]);
     assert.match(setcc.toString(), /^sete /);
     const shortJump = decode64([0x74, 0xf2]);
     assert.match(shortJump.toString(), /^je /);
+
+    // The spelling is the SDM's E/NE, not the Z/NZ that NASM also accepts, and the
+    // choice is what makes the disassembly re-assemble to the same bytes: the parser
+    // canonicalises jz and jnz to je and jne. So every condition suffix the decoder can
+    // emit has to be one the parser folds *back* to itself.
+    assert.match(decode64([0x0f, 0x85, 0x00, 0x00, 0x00, 0x00]).toString(), /^jne /);
+    assert.match(decode64([0x0f, 0x95, 0xc0]).toString(), /^setne /);
   });
 });
 
@@ -566,6 +620,153 @@ describe('decoder: operand size prefixes', () => {
   });
 });
 
+describe('decoder: operand widths', () => {
+  it('distinguishes mov eax from mov rax, which share a register index', () => {
+    // 8B C3 and 48 8B C3 differ by one prefix byte and mean different operations: the
+    // first writes RBX's low 32 bits and zeroes its top half, the second writes all 64.
+    // A register operand that records only the index cannot tell an executor which one
+    // it is holding, so the width has to be carried on the operand itself.
+    const narrow = decode64([0x8b, 0xc3]);
+    const wide = decode64([0x48, 0x8b, 0xc3]);
+    assert.deepEqual(narrow.operands[1], { kind: 'reg', reg: Reg.BX, size: 32 });
+    assert.deepEqual(wide.operands[1], { kind: 'reg', reg: Reg.BX, size: 64 });
+    assert.notDeepEqual(narrow.operands[1], wide.operands[1]);
+  });
+
+  it('records the width the 0x66 prefix selects', () => {
+    assert.deepEqual(decode64([0x66, 0x8b, 0xc3]).operands[1], { kind: 'reg', reg: Reg.BX, size: 16 });
+  });
+
+  it('records a real-mode default of 16 bits', () => {
+    // Real mode defaults to 16-bit operands, so an unprefixed 8B C3 is a 16-bit move -
+    // the same bytes as the 32-bit long-mode instruction above and a different one.
+    assert.deepEqual(decode16([0x8b, 0xc3]).operands[1], { kind: 'reg', reg: Reg.BX, size: 16 });
+  });
+
+  it('records 8 bits for the byte forms', () => {
+    // SPL, SIL and R8B-R15B exist only at this width, so an 8-bit operand printed or
+    // executed as a 64-bit register is wrong in a way no other width difference is.
+    // 88 /r is `mov r/m8, r8`, so the rm field is the destination and the reg field is
+    // the source: ModRM E0 is mod 11, reg 110, rm 000 - AL and SI.
+    assert.deepEqual(decode64([0x88, 0xe0]).operands[1], { kind: 'reg', reg: Reg.AX, size: 8, highByte: true });
+    assert.deepEqual(decode64([0x40, 0x88, 0xe0]).operands[1], { kind: 'reg', reg: Reg.SP, size: 8, highByte: false });
+    // REX.B extends the rm field, so the destination becomes R8B.
+    assert.deepEqual(decode64([0x41, 0x88, 0xe0]).operands[0], { kind: 'reg', reg: Reg.R8, size: 8, highByte: false });
+  });
+
+  it('records the address width, which is not the operand width', () => {
+    // 8B 07 is `mov ax, [bx]` in real mode and `mov eax, [rdi]` in long mode: the same
+    // ModRM rm field, read through two unrelated address tables, with different operand
+    // defaults. The address width decides *how* the field is read, so an operand that
+    // records only the operand size cannot express the difference at all.
+    const realPair = decode16([0x8b, 0x00]).operands[1]; // rm 000 -> [bx+si]
+    assert.equal(realPair?.kind, 'mem');
+    if (realPair?.kind === 'mem') {
+      assert.equal(realPair.addressWidth, 16);
+      assert.equal(realPair.base, Reg.BX);
+      assert.equal(realPair.index, Reg.SI);
+      assert.equal(realPair.scale, 1);
+    }
+
+    // rm 111 is the seventh row of the 16-bit table, which is [bx]. In 64-bit addressing
+    // the same field 7 is plainly rdi - the two address tables have nothing to do with
+    // each other, which is the strongest argument for recording the address width:
+    // `8B 07` reads `[bx]` here and `[rdi]` below, and only the mode says which.
+    const real = decode16([0x8b, 0x07]).operands[1];
+    if (real?.kind === 'mem') {
+      assert.equal(real.addressWidth, 16);
+      assert.equal(real.base, Reg.BX);
+      assert.equal(real.index, -1);
+    }
+
+    const long = decode64([0x8b, 0x07]).operands[1];
+    if (long?.kind === 'mem') {
+      // 64-bit addressing, even though the operand is 32-bit: the two widths are chosen
+      // by different prefixes and default independently in long mode.
+      assert.equal(long.addressWidth, 64);
+      assert.equal(long.base, Reg.DI);
+      assert.equal(long.index, -1);
+    }
+  });
+
+  it('gives a RIP-relative operand a 64-bit address width', () => {
+    const mem = decode64([0x8b, 0x05, 0x00, 0x00, 0x00, 0x00]).operands[1];
+    assert.equal(mem?.kind, 'mem');
+    if (mem?.kind === 'mem') {
+      assert.equal(mem.ripRelative, true);
+      assert.equal(mem.addressWidth, 64);
+    }
+  });
+});
+
+describe('decoder: read-modify-write groups', () => {
+  it('decodes CMOVcc with the condition in the low four opcode bits', () => {
+    // 0F 40-4F is one instruction with sixteen conditions, so the condition has to be
+    // recorded rather than folded into sixteen mnemonics - the same shape as Jcc and
+    // SETcc. The destination is in the reg field and the source in r/m.
+    //
+    // 0F 44 is CMOVZ, because the condition table is the standard one and 4 is E/Z -
+    // CMOVO is 0F 40. Reading the condition as "0F 4x is all one thing" is how 44 and
+    // 40 get swapped.
+    const z = decode64([0x0f, 0x44, 0xc1]);
+    assert.equal(z.mnemonic, Mnemonic.CMOVCC);
+    assert.equal(z.condition, 4);
+    assert.deepEqual(z.operands, [
+      { kind: 'reg', reg: Reg.AX, size: 32 },
+      { kind: 'reg', reg: Reg.CX, size: 32 },
+    ]);
+
+    assert.equal(decode64([0x0f, 0x40, 0xc1]).condition, 0);
+    assert.match(decode64([0x0f, 0x40, 0xc1]).toString(), /^cmovo/);
+    assert.equal(decode64([0x0f, 0x45, 0x03]).condition, 5);
+    // SDM spelling, consistent with Jcc and SETcc: NE, not the NZ NASM also accepts.
+    assert.match(decode64([0x0f, 0x45, 0x03]).toString(), /^cmovne/);
+    assert.match(z.toString(), /^cmove/);
+  });
+
+  it('names the CMOVcc source as a memory operand when mod is not 3', () => {
+    const mem = decode64([0x0f, 0x4c, 0x04, 0xcb]).operands[1];
+    assert.equal(mem?.kind, 'mem');
+  });
+
+  it('decodes XADD, whose byte opcode is C0 and not the wide C1', () => {
+    // 0F C0 is XADD r/m8, r8 and 0F C1 is XADD r/m, r - F0 is LOCK, a prefix, which is
+    // why the two are not adjacent. Reading C0 with a 32-bit operand size makes an
+    // 8-bit atomic add look like a 32-bit one.
+    //
+    // ModRM C3 is mod 11, so both operands are registers and neither gets an address
+    // form; ModRM 03 is mod 00 and therefore memory.
+    const byte = decode64([0x0f, 0xc0, 0xc3]);
+    assert.equal(byte.mnemonic, Mnemonic.XADD);
+    assert.deepEqual(byte.operands[0], { kind: 'reg', reg: Reg.BX, size: 8, highByte: false });
+    assert.deepEqual(byte.operands[1], { kind: 'reg', reg: Reg.AX, size: 8, highByte: false });
+
+    const byteMem = decode64([0x0f, 0xc0, 0x03]);
+    assert.equal(byteMem.operands[0]?.kind, 'mem');
+    assert.deepEqual(byteMem.operands[1], { kind: 'reg', reg: Reg.AX, size: 8, highByte: false });
+
+    const wide = decode64([0x0f, 0xc1, 0x03]);
+    assert.equal(wide.mnemonic, Mnemonic.XADD);
+    assert.equal(wide.operands[0]?.kind, 'mem');
+    assert.deepEqual(wide.operands[1], { kind: 'reg', reg: Reg.AX, size: 32 });
+  });
+
+  it('decodes CMPXCHG, whose byte opcode is B0 and not the wide B1', () => {
+    // Same shape, different opcodes. CMPXCHG r/m8, r8 is defined by the SDM - it is
+    // not one of the byte forms that are left undefined, so refusing it would be
+    // refusing a real instruction.
+    const byte = decode64([0x0f, 0xb0, 0xc3]);
+    assert.equal(byte.mnemonic, Mnemonic.CMPXCHG);
+    assert.deepEqual(byte.operands[0], { kind: 'reg', reg: Reg.BX, size: 8, highByte: false });
+    assert.deepEqual(byte.operands[1], { kind: 'reg', reg: Reg.AX, size: 8, highByte: false });
+
+    const wide = decode64([0x48, 0x0f, 0xb1, 0x03]);
+    assert.equal(wide.mnemonic, Mnemonic.CMPXCHG);
+    assert.equal(wide.operands[0]?.kind, 'mem');
+    assert.deepEqual(wide.operands[1], { kind: 'reg', reg: Reg.AX, size: 64 });
+  });
+});
+
 describe('decoder: disassembly text', () => {
   it('renders a readable instruction', () => {
     const insn = decode64([0x48, 0x8d, 0x44, 0x8b, 0x08]);
@@ -574,5 +775,30 @@ describe('decoder: disassembly text', () => {
     assert.match(text, /rbx/);
     assert.match(text, /rcx\*4/);
     assert.match(text, /bytes/);
+  });
+
+  it('prints the register width the instruction actually uses', () => {
+    // `mov eax, ecx` and `mov rax, rcx` differ only in REX.W, so printing rax for both
+    // misstates what the instruction does to the top half of the register.
+    assert.match(decode64([0x0f, 0x44, 0xc1]).toString(), /eax/);
+    assert.match(decode64([0x48, 0x0f, 0x44, 0xc1]).toString(), /rax/);
+  });
+
+  it('prints an 8-bit register by its byte name, including the R8B-R15B set', () => {
+    assert.match(decode64([0x0f, 0x94, 0xc0]).toString(), /sete al/);
+    // REX.B extends the rm field, so rm 100 becomes R12B - the whole point of the
+    // 64-bit register file's byte half being separately named.
+    assert.match(decode64([0x41, 0x0f, 0x94, 0xc4]).toString(), /sete r12b/);
+    assert.match(decode64([0x41, 0x0f, 0x94, 0xc3]).toString(), /sete r11b/);
+    // And the high byte names survive where there is no REX at all.
+    assert.match(decode64([0x88, 0xe0]).toString(), /ah/);
+  });
+
+  it('prints 16-bit addressing with 16-bit register names and no scale factor', () => {
+    // 16-bit addressing has no scale factor at all, so `[bx+si*1]` states a
+    // multiplication with no encoding, and the registers are bx and si rather than rbx
+    // and rsi.
+    assert.match(decode16([0x8b, 0x00]).toString(), /\[bx\+si\]/);
+    assert.doesNotMatch(decode16([0x8b, 0x00]).toString(), /rbx|\*1/);
   });
 });
