@@ -173,10 +173,23 @@ export const VIDEO_MODES: readonly VideoModeInfo[] = [
 ];
 
 /**
- * Largest buffer the adapter must be able to back. All supported modes fit in
- * the standard 128 KiB VGA aperture (0xA0000-0xBFFFF).
+ * Size of the VGA memory aperture, and of the framebuffer backing it.
+ *
+ * The aperture is the full 128 KiB window 0xA0000-0xBFFFF, which is what a real
+ * adapter decodes regardless of the current mode. Backing the *whole* window
+ * rather than just the active mode matters for two reasons: the MMIO region's
+ * start and end then never move, so a mode switch cannot invalidate a region
+ * already registered with the bus; and the text buffer at 0xB8000 lives at
+ * aperture offset 0x18000 rather than at offset zero.
+ *
+ * `framebuffer` is therefore indexed relative to the *aperture base*, never by
+ * absolute physical address. Indexing it by physical address - as this adapter
+ * originally did - puts every access past the end of a 128 KiB array, where
+ * `Uint8Array` silently discards writes and reads back zero, which presents as a
+ * text console that accepts writes and displays nothing.
  */
-const FRAMEBUFFER_BYTES = 0x20000;
+const VGA_APERTURE_BASE = 0x000a_0000;
+const FRAMEBUFFER_BYTES = 0x0002_0000;
 
 const CRTC_PORT = 0x3d4;
 const SEQ_PORT = 0x3c4;
@@ -196,9 +209,12 @@ export class VgaAdapter implements PortDevice, MmioRegion {
   readonly portCount = 0x2b; // 0x3b0 .. 0x3da
 
   /**
-   * The framebuffer. Guest writes land here through the MMIO region, and the
-   * host reads the same bytes to render a screenshot, so what you see is
-   * literally what the kernel drew.
+   * The framebuffer, indexed relative to the aperture base (0xA0000).
+   *
+   * Guest writes land here through the MMIO region, and the host reads the same
+   * bytes to render a screenshot, so what you see is literally what the kernel
+   * drew. Use `frameIndex` to translate an absolute physical address; do not
+   * index this array with one directly.
    */
   readonly framebuffer = new Uint8Array(FRAMEBUFFER_BYTES);
 
@@ -336,6 +352,29 @@ export class VgaAdapter implements PortDevice, MmioRegion {
   /* MMIO: the framebuffer aperture                                           */
   /* ---------------------------------------------------------------------- */
 
+  /**
+   * Translate an absolute physical address into a framebuffer index.
+   *
+   * Returns -1 for an address outside the aperture so that callers can bail out
+   * rather than silently writing to the wrong place. Clamping instead would turn
+   * a guest bug into a plausible-looking screen, which is worse than failing.
+   */
+  private frameIndex(physicalAddress: number): number {
+    const index = physicalAddress - VGA_APERTURE_BASE;
+    if (index < 0 || index >= FRAMEBUFFER_BYTES) return -1;
+    return index;
+  }
+
+  /** Aperture offset of the start of the active mode's window. */
+  private get windowOffset(): number {
+    return Number(this.mode.base) - VGA_APERTURE_BASE;
+  }
+
+  /** The active mode. Exposed for renderers, which need its resolution. */
+  get videoMode(): VideoModeInfo {
+    return this.mode;
+  }
+
   get start(): bigint {
     return this.mode.base;
   }
@@ -344,27 +383,36 @@ export class VgaAdapter implements PortDevice, MmioRegion {
     return this.mode.base + BigInt(this.mode.size);
   }
 
-  /** VGA aperture covering both the graphics and text windows. */
+  /**
+   * The aperture this adapter exposes over MMIO: the whole 0xA0000-0xBFFFF
+   * window, independent of the current mode.
+   *
+   * The bus calls `read`/`write` with `address - region.start`, so because this
+   * region starts at the aperture base, the offset the adapter receives *is*
+   * already the framebuffer index. Adding `mode.base` here, as this adapter
+   * originally did, double-counted the base and addressed 0x18000 bytes past the
+   * start of the text buffer.
+   */
   static readonly APERTURE = {
     start: MemoryMap.VGA_WINDOW_START,
     end: MemoryMap.VGA_WINDOW_END,
   };
 
   read(offset: bigint, widthBytes: number): bigint {
-    const base = Number(this.mode.base);
-    const addr = base + Number(offset);
+    const index = this.frameIndex(Number(offset) + VGA_APERTURE_BASE);
+    if (index < 0) return 0n;
     let value = 0n;
     for (let i = widthBytes - 1; i >= 0; i--) {
-      value = (value << 8n) | BigInt(this.framebuffer[addr + i] ?? 0);
+      value = (value << 8n) | BigInt(this.framebuffer[index + i] ?? 0);
     }
     return value;
   }
 
   write(offset: bigint, widthBytes: number, value: bigint): void {
-    const base = Number(this.mode.base);
-    const addr = base + Number(offset);
+    const index = this.frameIndex(Number(offset) + VGA_APERTURE_BASE);
+    if (index < 0) return;
     for (let i = 0; i < widthBytes; i++) {
-      this.framebuffer[addr + i] = Number((value >> BigInt(8 * i)) & 0xffn);
+      this.framebuffer[index + i] = Number((value >> BigInt(8 * i)) & 0xffn);
     }
     this.revision++;
   }
@@ -382,7 +430,7 @@ export class VgaAdapter implements PortDevice, MmioRegion {
       throw new RangeError(`cell (${column},${row}) is outside ${this.mode.columns}x${this.mode.rows}`);
     }
     const index = row * this.mode.columns + column;
-    const base = Number(this.mode.base);
+    const base = this.windowOffset;
     const char = this.framebuffer[base + index * 2] ?? 0x20;
     const attr = this.framebuffer[base + index * 2 + 1] ?? 0x07;
     return {
@@ -400,7 +448,7 @@ export class VgaAdapter implements PortDevice, MmioRegion {
       throw new RangeError(`cell (${column},${row}) is outside ${this.mode.columns}x${this.mode.rows}`);
     }
     const index = row * this.mode.columns + column;
-    const base = Number(this.mode.base);
+    const base = this.windowOffset;
     let attr = (cell.foreground & 0x0f) | ((cell.background & 0x07) << TextAttribute.BACKGROUND_SHIFT);
     if (cell.blink || (cell.background & 0x08) !== 0) attr |= TextAttribute.BLINK_MASK;
     this.framebuffer[base + index * 2] = cell.char & 0xff;
@@ -434,7 +482,7 @@ export class VgaAdapter implements PortDevice, MmioRegion {
       this.setPlanarPixel(x, y, colour);
       return;
     }
-    const base = Number(this.mode.base);
+    const base = this.windowOffset;
     this.framebuffer[base + y * this.mode.stride + x] = colour & 0xff;
     this.revision++;
   }
@@ -442,7 +490,7 @@ export class VgaAdapter implements PortDevice, MmioRegion {
   getPixel(x: number, y: number): number {
     if (this.mode.textMode || x < 0 || x >= this.mode.hres || y < 0 || y >= this.mode.vres) return 0;
     if (this.mode.planar) return this.getPlanarPixel(x, y);
-    const base = Number(this.mode.base);
+    const base = this.windowOffset;
     return this.framebuffer[base + y * this.mode.stride + x] ?? 0;
   }
 
@@ -451,7 +499,7 @@ export class VgaAdapter implements PortDevice, MmioRegion {
    * scanline, so pixel `x` lives in plane `x & 3` at bit `7 - (x >> 2)`.
    */
   private setPlanarPixel(x: number, y: number, colour: number): void {
-    const base = Number(this.mode.base);
+    const base = this.windowOffset;
     const plane = x & 3;
     const byteOffset = base + y * this.mode.stride + (x >> 2);
     const bit = 7 - (x >> 2 & 7);
@@ -462,7 +510,7 @@ export class VgaAdapter implements PortDevice, MmioRegion {
   }
 
   private getPlanarPixel(x: number, y: number): number {
-    const base = Number(this.mode.base);
+    const base = this.windowOffset;
     const plane = x & 3;
     const byteOffset = base + y * this.mode.stride + (x >> 2);
     const bit = 7 - (x >> 2 & 7);
@@ -583,7 +631,7 @@ export class VgaAdapter implements PortDevice, MmioRegion {
   renderToRgb(): Uint32Array {
     const { hres, vres } = this.mode;
     const out = new Uint32Array(hres * vres);
-    const fbBase = Number(this.mode.base);
+    const fbBase = this.windowOffset;
 
     if (this.mode.textMode) {
       for (let row = 0; row < this.mode.rows; row++) {
@@ -620,6 +668,7 @@ export class VgaAdapter implements PortDevice, MmioRegion {
 
     for (let y = 0; y < vres; y++) {
       const rowStart = fbBase + y * this.mode.stride;
+      if (rowStart + hres > FRAMEBUFFER_BYTES) break;
       for (let x = 0; x < hres; x++) {
         const index = this.framebuffer[rowStart + x] ?? 0;
         out[y * hres + x] = this.palette[index] ?? 0x000000;

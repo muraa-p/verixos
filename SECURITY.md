@@ -47,7 +47,7 @@ If you believe you have found a genuine security-relevant defect, please report
 it privately rather than opening a public issue.
 
 **Use GitHub Security Advisories private reporting.** Go to the repository's
-[Security tab](https://github.com/verixos/verixos/security), then
+[Security tab](https://github.com/muraa-p/verixos/security), then
 **Report a vulnerability**. This opens a private channel visible only to you and
 the maintainers, and gives the report somewhere to live that is separate from the
 issue tracker.

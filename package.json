@@ -18,12 +18,14 @@
     "LICENSE"
   ],
   "scripts": {
+    "start": "node --experimental-strip-types --no-warnings src/cli.ts",
     "run": "node --experimental-strip-types --no-warnings src/cli.ts",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --experimental-strip-types --no-warnings --test tests/*.test.ts",
     "test:watch": "node --experimental-strip-types --no-warnings --test --watch tests/*.test.ts",
     "check": "npm run typecheck && npm run test",
+    "screenshot": "node --experimental-strip-types --no-warnings tools/screenshot.ts docs/assets",
     "image": "node --experimental-strip-types --no-warnings tools/build-image.ts",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true});require('node:fs').rmSync('images',{recursive:true,force:true})\""
   },
@@ -33,12 +35,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/verixos/verixos.git"
+    "url": "git+https://github.com/muraa-p/verixos.git"
   },
   "bugs": {
-    "url": "https://github.com/verixos/verixos/issues"
+    "url": "https://github.com/muraa-p/verixos/issues"
   },
-  "homepage": "https://github.com/verixos/verixos#readme",
+  "homepage": "https://github.com/muraa-p/verixos#readme",
   "keywords": [
     "operating-system",
     "kernel",

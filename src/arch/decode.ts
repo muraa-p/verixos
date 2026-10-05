@@ -542,7 +542,6 @@ export class InstructionDecoder {
     let scale = 1;
     let ripRelative = false;
     let disp = 0n;
-    let hasDisp = false;
 
     if (rmRaw === 4) {
       const sib = this.u8();
@@ -553,37 +552,45 @@ export class InstructionDecoder {
       // index field 100 means "no index" unless REX.X extends it to R12.
       if (indexField === 4 && this.rexX === 0) index = -1;
       base = baseField | (this.rexB << 3);
+      // SIB with base field 101 and mod=00 has no base register at all, so the
+      // whole address is the disp32 that follows. That displacement still has
+      // to be consumed: without it the instruction length comes out short, the
+      // next instruction is fetched from the middle of this one, and every
+      // absolute address reached through a SIB byte decodes wrongly.
       if (mod === 0 && baseField === 5) {
-        base = -1; // SIB with no base: pure disp32
-        hasDisp = true;
-      }
-    } else if (rmRaw === 5 && mod === 0) {
-      hasDisp = true;
-      if (size === 64) {
-        // RIP-relative. The displacement is relative to the *end* of the
-        // instruction, which the CPU resolves once the length is known.
-        ripRelative = true;
         base = -1;
-        index = -1;
         return {
           kind: 'mem',
           base,
           index,
           scale,
           disp: this.immSigned(32),
-          ripRelative,
+          ripRelative: false,
+          sizeOverride: size === 64 ? '64' : '32',
+        };
+      }
+    } else if (rmRaw === 5 && mod === 0) {
+      if (size === 64) {
+        // RIP-relative. The displacement is relative to the *end* of the
+        // instruction, which the CPU resolves once the length is known.
+        return {
+          kind: 'mem',
+          base: -1,
+          index: -1,
+          scale,
+          disp: this.immSigned(32),
+          ripRelative: true,
           sizeOverride: '64',
         };
       }
-      base = -1;
-      index = -1;
+      // 32-bit absolute address.
       return {
         kind: 'mem',
-        base,
-        index,
+        base: -1,
+        index: -1,
         scale,
         disp: this.immSigned(32),
-        ripRelative,
+        ripRelative: false,
         sizeOverride: '32',
       };
     } else {
@@ -592,12 +599,9 @@ export class InstructionDecoder {
 
     if (mod === 1) {
       disp = this.immSigned(8);
-      hasDisp = true;
     } else if (mod === 2) {
       disp = this.immSigned(32);
-      hasDisp = true;
     }
-    void hasDisp;
 
     return {
       kind: 'mem',
@@ -1338,10 +1342,15 @@ export function formatInstruction(
   operands: readonly Operand[],
   condition?: number,
 ): string {
-  const name =
-    condition !== undefined && (mnemonic === Mnemonic.JCC || mnemonic === Mnemonic.SETCC)
-      ? `${mnemonic}${CONDITION_NAMES[condition]}`
-      : mnemonic;
+  // `jcc`/`setcc` are the map names, not the assembler spellings. Naively
+  // appending the condition suffix yields "jcce" and "sete"; the assembler mnemonics
+  // are "je" and "setz", so the prefix has to be replaced rather than extended.
+  let name: string = mnemonic;
+  if (condition !== undefined) {
+    const suffix = CONDITION_NAMES[condition];
+    if (mnemonic === Mnemonic.JCC) name = `j${suffix}`;
+    else if (mnemonic === Mnemonic.SETCC) name = `set${suffix}`;
+  }
   const text = operands.map(formatOperand).join(', ');
   const body = `${name}${text ? ` ${text}` : ''}`;
   return `${body.padEnd(30, ' ')}  ; ${length} bytes @ 0x${address.toString(16)}`;

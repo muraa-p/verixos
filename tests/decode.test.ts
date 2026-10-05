@@ -398,6 +398,85 @@ describe('decoder: shifts', () => {
   });
 });
 
+/**
+ * Instruction-length accounting is the decoder's highest-consequence duty. If
+ * `length` is short, the CPU fetches its next instruction from the middle of this
+ * one and the trace diverges in a way that looks like a memory fault, so each
+ * test here checks the length as well as the operands.
+ */
+describe('decoder: sequential decode over a byte stream', () => {
+  /** Decode every instruction in `bytes` from `base`, requiring exact coverage. */
+  function disassemble(bytes: number[], base = 0x401_000n): string[] {
+    const buffer = Uint8Array.from(bytes);
+    const decoder = new InstructionDecoder(bufferReader(buffer, base), CpuMode.LONG64);
+    const lines: string[] = [];
+    let rip = base;
+    const end = base + BigInt(buffer.length);
+    while (rip < end) {
+      const insn = decoder.decode(rip);
+      lines.push(insn.toString());
+      rip += BigInt(insn.length);
+    }
+    assert.equal(
+      rip - base,
+      BigInt(buffer.length),
+      `decoding consumed ${rip - base} of ${buffer.length} bytes; lengths are wrong`,
+    );
+    return lines;
+  }
+
+  it('consumes the disp32 of a SIB operand with no base register', () => {
+    // 48 8b 04 25 78 56 34 12 = mov rax, [0x12345678].
+    // SIB 0x25 has base field 101 with mod=00, which means "no base, the address
+    // is the disp32 that follows". Failing to consume that disp32 makes the
+    // instruction four bytes short.
+    const insn = decode64([0x48, 0x8b, 0x04, 0x25, 0x78, 0x56, 0x34, 0x12]);
+    assert.equal(insn.length, 8);
+    if (insn.operands[1]?.kind === 'mem') {
+      assert.equal(insn.operands[1].base, -1);
+      assert.equal(insn.operands[1].disp, 0x1234_5678n);
+      assert.equal(insn.operands[1].ripRelative, false);
+    }
+  });
+
+  it('accounts for every byte of a mixed stream', () => {
+    const lines = disassemble([
+      0x48, 0x31, 0xc0, // xor rax, rax
+      0x48, 0x89, 0xc3, // mov rbx, rax
+      0x48, 0xc7, 0xc7, 0x00, 0x00, 0x00, 0x00, // mov rdi, 0
+      0x0f, 0x1f, 0x40, 0x00, // nop dword [rax]
+      0x65, 0x48, 0x8b, 0x04, 0x25, 0x78, 0x56, 0x34, 0x12, // mov rax, fs:[0x12345678]
+      0xf3, 0xab, // rep stosq
+      0x48, 0x0f, 0xaf, 0xc1, // imul rax, rcx
+      0x0f, 0x84, 0x0a, 0x00, 0x00, 0x00, // je +0xa
+    ]);
+    assert.match(lines[0]!, /^xor rax, rax/);
+    assert.match(lines[4]!, /^mov rax, \[0x12345678\]/);
+    assert.match(lines[5]!, /^stos/);
+    assert.match(lines[7]!, /^je 0x401030/);
+  });
+
+  it('keeps the REP prefix on a string operation', () => {
+    // f3 ab = rep stosq, the canonical memset idiom. Dropping the prefix would
+    // turn it into a single store.
+    const insn = decode64([0xf3, 0xab]);
+    assert.equal(insn.mnemonic, Mnemonic.STOS);
+    assert.equal(insn.rep, 'rep');
+    assert.equal(insn.length, 2);
+  });
+
+  it('spells conditional jumps and sets as the assembler does', () => {
+    // "jcce" and "sete" are map names, not mnemonics. Any assembler consuming
+    // this disassembly has to see je and setz.
+    const jcc = decode64([0x0f, 0x84, 0x00, 0x00, 0x00, 0x00]);
+    assert.match(jcc.toString(), /^je /);
+    const setcc = decode64([0x0f, 0x94, 0xc0]);
+    assert.match(setcc.toString(), /^sete /);
+    const shortJump = decode64([0x74, 0xf2]);
+    assert.match(shortJump.toString(), /^je /);
+  });
+});
+
 describe('decoder: group 3', () => {
   it('decodes NOT, NEG, MUL, IMUL, DIV and IDIV', () => {
     const cases: [number, Mnemonic][] = [

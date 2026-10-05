@@ -21,7 +21,7 @@ premise.
 ## Getting set up
 
 ```sh
-git clone https://github.com/verixos/verixos
+git clone https://github.com/muraa-p/verixos
 cd verixos
 npm install
 ```

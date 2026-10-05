@@ -13,6 +13,7 @@ Status values:
 | Status | Meaning |
 | --- | --- |
 | Complete | Implemented and exercised |
+| Partially done | Built out of dependency order; later phases' output exists, earlier wiring does not |
 | In progress | Partially built; the remainder is being worked on |
 | Not started | Designed and scoped, no implementation |
 | Planned | Direction agreed, detail not yet written down |
@@ -29,7 +30,9 @@ feeds the next, and no phase is considered finished until the shell responds.
 
 ## Phase 0: the machine model
 
-**Status: In progress**
+**Status: In progress** — roughly half done. The decoder and the device models are
+complete; the interpreter, the descriptor tables and the page walk are not. See the
+per-goal breakdown below.
 
 The substrate everything else runs on. If this is not faithful, every later
 phase is testing against a fiction.
@@ -38,20 +41,22 @@ phase is testing against a fiction.
 
 - Model x86-64 architectural state exactly: sixteen general-purpose registers, RIP,
   RFLAGS, CR0/CR2/CR3/CR4, and the correct sub-register semantics for 8/16/32/64-bit
-  access.
+  access. — **Complete**
 - Implement a real instruction decoder and interpreter for the instruction classes
-  the milestones need, raising `#UD` for anything undecodable.
+  the milestones need, raising `#UD` for anything undecodable. — **Decoder
+  complete, interpreter not started**
 - Provide a physical memory bus with MMIO regions and a separate port I/O bus,
-  both strict about bounds, width and ownership.
+  both strict about bounds, width and ownership. — **Complete**
 - Provide device models: 8259A PIC, 8254 PIT, 16450 UART, PS/2 controller, VGA with
-  CRTC and sequencer.
+  CRTC and sequencer. — **Complete**
 - Model descriptors: GDT with architectural descriptor encoding, IDT with 16-byte
-  gates.
+  gates. — **Constants defined; no tables built or loaded**
 - Implement the four-level page walk with real permission checks and real page
-  fault error codes.
-- Implement exceptions and the dispatch path, including double fault.
+  fault error codes. — **PTE layout and CR bits defined; no translation**
+- Implement exceptions and the dispatch path, including double fault. — **Vectors
+  defined; no gate handling**
 - Keep execution deterministic: a given image and input sequence must produce the
-  same trace every run.
+  same trace every run. — **By construction; not yet demonstrated end to end**
 
 ### Deliverable
 
@@ -77,7 +82,7 @@ produces a reproducible register and memory trace.
 
 ## Phase 1: boot to kernel entry
 
-**Status: In progress**
+**Status: Not started** — the assembler this phase depends on does not exist yet.
 
 ### Goals
 
@@ -108,7 +113,7 @@ enabled, paging on, and a known memory map.
 
 ## Phase 2: memory management
 
-**Status: In progress**
+**Status: Not started** — depends on Phase 1.
 
 ### Goals
 
@@ -144,7 +149,9 @@ demand-paged access and recovers, and heap-allocates without corruption.
 
 ## Phase 3: interrupts and drivers
 
-**Status: In progress**
+**Status: Partially done out of order.** The device models exist and are tested,
+but the driver model, exception dispatch and interrupt wiring above them have not
+been written. The kernel cannot yet use any of the devices.
 
 ### Goals
 
