@@ -30,9 +30,9 @@ feeds the next, and no phase is considered finished until the shell responds.
 
 ## Phase 0: the machine model
 
-**Status: In progress** — roughly half done. The decoder and the device models are
-complete; the interpreter, the descriptor tables and the page walk are not. See the
-per-goal breakdown below.
+**Status: In progress** — a little over half done. The decoder, the assembler
+and the device models are complete; the interpreter, the descriptor tables and
+the page walk are not. See the per-goal breakdown below.
 
 The substrate everything else runs on. If this is not faithful, every later
 phase is testing against a fiction.
@@ -45,6 +45,8 @@ phase is testing against a fiction.
 - Implement a real instruction decoder and interpreter for the instruction classes
   the milestones need, raising `#UD` for anything undecodable. — **Decoder
   complete, interpreter not started**
+- Provide an assembler whose output the decoder agrees with, verified by round
+  trip over a corpus rather than by inspection. — **Complete**
 - Provide a physical memory bus with MMIO regions and a separate port I/O bus,
   both strict about bounds, width and ownership. — **Complete**
 - Provide device models: 8259A PIC, 8254 PIT, 16450 UART, PS/2 controller, VGA with
@@ -82,7 +84,8 @@ produces a reproducible register and memory trace.
 
 ## Phase 1: boot to kernel entry
 
-**Status: Not started** — the assembler this phase depends on does not exist yet.
+**Status: Not started** — unblocked. The assembler this phase depends on now
+exists and is round-trip-checked against the decoder.
 
 ### Goals
 

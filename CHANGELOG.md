@@ -11,7 +11,100 @@ not guaranteed.
 
 ## [Unreleased]
 
-Nothing yet.
+### Instruction set: decoder completion and a full assembler
+
+The instruction decoder was brought to coverage of every instruction class the
+milestones need, and the assembler was written from scratch and then checked
+against the decoder by a round-trip oracle. The oracle found sixteen real bugs,
+each of which produced plausible bytes and would therefore have passed a test
+that only compared the encoder against itself.
+
+### Added
+
+**Instruction decoder** (`src/arch/decode.ts`)
+
+- `CMOVcc` at all sixteen conditions, `XADD`, and `CMPXCHG`, including their
+  byte-register forms.
+- `CBW`, `CWD`, `CWDE`, `CDQ` and `CDQE` as five distinct mnemonics. `48 98` is
+  `cdqe` and `98` is `cwde`, so collapsing them would make one re-assemble to
+  the other and silently change the width of the result.
+- Width-suffixed string primitives: `movsb`/`movsw`/`movsd`/`movsq` and the same
+  four for `stos`, `lods`, `scas` and `cmps`, each carrying its own width rather
+  than reporting an operand size that the encoding never stated.
+- `RCL` and `RCR` in the shift group, which were decoding as `unimplemented`.
+- Both `0F 00` and `0F 01` system groups against their SDM tables, including
+  `SGDT`, `SIDT`, `SLDT`, `STR`, `LLDT`, `LTR`, `VERR`, `VERW`, `SMSW`, `LMSW`,
+  `INVLPG`, `XGETBV` and `XSETBV`.
+- `SYSRET`, `WBINVD`, `CLTS`, `XLATB`, `RDMSR` and `WRMSR`.
+- `RETF` and `RETFQ` as separate mnemonics. The SDM draws the line explicitly for
+  far returns, so `CB` and `48 CB` in long mode move different amounts of the
+  stack and must not print the same.
+- `PAUSE` reported without a repeat prefix. `F3 90` is one instruction whose
+  encoding contains the `F3`; printing it as `rep nop` re-assembled to `90`, and
+  `rep pause` would have re-assembled to `F3 F3 90`, a decoder error.
+- `INS` and `OUTS` at all four widths, split on the operand size exactly as
+  `MOVS` is, rather than existing only as 8- and 16-bit forms.
+- `XCHG` at all three widths plus the `90+rb` short form, with the ModRM r/m
+  field chosen by which operand is memory.
+- Far pointers as a single operand carrying a selector and an offset, printing as
+  `jmp far 0x1000:0x1234`, plus `CALLF`/`JMPF`/`RETF`.
+
+**Assembler** (`src/asm/`)
+
+- A lexer, a recursive-descent parser, an AST, an encoder and a two-pass
+  assembler, with no runtime dependencies and no non-erasable syntax.
+- All three CPU modes, selected by `.code16`, `.code32` and `.code64`, with the
+  mode's own default operand size and address width honoured throughout.
+- An expression evaluator with full C operator precedence, string and character
+  literals, and the usual arithmetic and bitwise operators.
+- Labels resolved in two passes, with forward references allowed: an unresolved
+  reference gets a provisional value and a widening loop runs until the byte
+  layout is stable. Convergence is refused while any reference is still
+  provisional, so an undefined label reports that it is not defined rather than
+  encoding a zero displacement.
+- Branch-width relaxation that is iterative and monotone rather than a guess: a
+  branch starts at its shortest form and widens when a displacement does not fit,
+  which means no pass can narrow it again and produce oscillation.
+- Segment, directive and data-section support, with `.org` unable to move
+  backwards and no `.bss`, because a section that is not in the image cannot be
+  addressed by an offset in it.
+
+**Round-trip oracle** (`tests/asm.test.ts`)
+
+- A 343-instruction, 1069-byte corpus across seventeen groups and all three modes,
+  asserting four things per instruction: that decoded lengths sum to exactly the
+  assembled length, that every decoded line re-assembles, that the bytes are
+  identical modulo one documented normalisation, and that the text is stable
+  across a second decode.
+- A second test pinning the normalisation set to exactly one entry and checking
+  that the entry names encodings the corpus really produces, so a new difference
+  cannot be added to the table without anyone deciding to.
+- Corpus size floors, so an emptied corpus fails the test rather than passing it
+  vacuously.
+
+### Fixed
+
+- Real-mode `push ax` emitted a `0x66`, assembling to `push eax`. The operand-size
+  prefix was unconditional rather than conditional on the mode's default size.
+- The `0F 01` group was numbered from the wrong SDM table. `SLDT`, `STR` and
+  `LTR` were placed at the selectors `/0`, `/1` and `/4` of `0F 01`, where the SDM
+  has `SGDT`, `SIDT` and `SMSW`; the correct group is `0F 00`. The failure was
+  asymmetric and therefore dangerous - `sldt` would have assembled to `sgdt`, a
+  store where a read was asked for.
+- `XGETBV` and `XSETBV` decoded as `LGDT`, because they share the `0F 01` ModRM
+  byte with the group without being part of it.
+- `0F 07` decoded as `SWAPGS` rather than `SYSRET`.
+- `0F 09`, `0F 06`, `0F 30`, `0F 32` and `0F D7` were not decoded at all, though
+  the encoder produced all five.
+- `SMSW` and `LMSW` reported their register destination as 16 bits regardless of
+  the operand size, so `smsw eax` printed as `smsw ax`.
+- Protected 32-bit mode used 16 as its default operand size, so `mov eax, ebx` in
+  `.code32` was a 16-bit instruction.
+- `POP CS` was encodable. It is not an instruction - the SDM states that the pop
+  cannot target CS - and `0x0F` is the escape byte, so the bytes it emitted had an
+  instruction length that depended on whatever followed.
+- `PAUSE` reported its `F3` as a repeat prefix, producing text that re-assembled
+  to two `F3` bytes.
 
 ## [0.1.0] - Unreleased
 

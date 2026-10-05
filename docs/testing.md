@@ -53,12 +53,21 @@ has not been written yet; see [Limitations](https://github.com/muraa-p/verixos#l
 | --- | --- |
 | `tests/arch.test.ts` | Architectural constants, register file sub-register semantics, flag bits, page table entry layout, selector encoding |
 | `tests/decode.test.ts` | Instruction decoding against hand-written byte sequences, including instruction-length accounting |
+| `tests/asm.test.ts` | The assembler, and the encoder/decoder round-trip oracle |
 | `tests/vga.test.ts` | VGA aperture addressing, text cells, MMIO offsets, and rendered pixels |
 
 A note on `decode.test.ts`: when it asserts a specific byte layout, the comment
 cites why those bytes are what they are, because a decoder that merely agrees with
 itself is worth nothing. Several assertions in it were wrong when first written and
 the encoder was correct; those were corrected rather than the other way round.
+
+A note on `asm.test.ts`: the last two tests are the ones worth reading first. They
+assemble a 343-instruction corpus, decode it, re-assemble every decoded line at
+its own address, and require the bytes and the text to come back unchanged. That is
+the only check in the project that compares the two halves of the instruction set
+against each other rather than against a hand-written expectation, and it is what
+found sixteen real bugs during development. A test that only checked the encoder
+against itself would have passed every one of them.
 
 ## Manual exploration
 
