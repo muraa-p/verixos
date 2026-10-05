@@ -1,0 +1,25 @@
+# Normalise line endings in the repository, regardless of the contributor's
+# core.autocrlf setting. Without this, a Windows checkout silently rewrites every
+# file to CRLF and the diff of an otherwise pure-logic change becomes noise.
+* text=auto eol=lf
+
+# Anything that genuinely is binary.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.core binary
+
+# Build and image artefacts. These are produced, not authored.
+dist/** linguist-generated=true -diff
+images/** linguist-generated=true -diff
+
+# Documentation and configuration are text; keep them diffable and normalised.
+*.md text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.ts text eol=lf
+
+# Keep the licence file out of language statistics.
+LICENSE linguist-documentation
