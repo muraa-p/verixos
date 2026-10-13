@@ -197,7 +197,17 @@ export interface KeyEvent {
 export class Ps2Keyboard {
   readonly name = 'ps2-keyboard';
   readonly startPort = 0x60;
-  readonly portCount = 2;
+  /**
+   * 0x60 through 0x64.
+   *
+   * The controller's command register lives at 0x64, not 0x61, and a guest that
+   * cannot reach it cannot drive the keyboard at all: enabling scanning is a write
+   * of 0xF4 to the data port *followed by* 0xD4 to 0x64. Claiming two ports made
+   * that second write fault, which is a #GP in the middle of boot for a device
+   * that is perfectly present. The middle two are unimplemented and answer as
+   * zeros, which is what an absent auxiliary port does on real hardware.
+   */
+  readonly portCount = 5;
 
   private status = Ps2Status.INPUT_BUFFER_FULL | Ps2Status.TRANSLATION;
 

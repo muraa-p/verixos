@@ -462,6 +462,34 @@ export function signExtend(v: bigint, width: number): bigint {
   return ((masked ^ signBit) - signBit) & 0xffff_ffff_ffff_ffffn;
 }
 
+/**
+ * Interpret the low `width` bits of `v` as a **signed bigint**.
+ *
+ * `signExtend` answers a different question. It produces the 64-bit two's
+ * complement pattern, which is what a register should *contain* - and for that
+ * purpose it is right. Arithmetic wants the value, not the pattern: a 16-bit
+ * `-100` is the 64-bit pattern 0xFFFFFFFFFFFFFF9C, and dividing that pattern by
+ * seven yields 613566742 rather than -14. Mixing the two up is not a subtle
+ * difference; it turns signed multiplication, division and arithmetic right
+ * shift into unsigned operations that are correct only for non-negative inputs.
+ *
+ * Bigint rather than `toSigned`'s JS number because a 64-bit quotient does not
+ * survive a round trip through a double.
+ */
+export function signedValue(v: bigint, width: number): bigint {
+  const bits = BigInt(Math.min(Math.max(width, 1), 64));
+  if (bits >= 64n) return v;
+  const modulus = 1n << bits;
+  const masked = v & (modulus - 1n);
+  return masked >= modulus >> 1n ? masked - modulus : masked;
+}
+
+/** True when `value` is representable as a signed integer of `width` bits. */
+export function fitsSigned(value: bigint, width: number): boolean {
+  const limit = 1n << (BigInt(width) - 1n);
+  return value >= -limit && value < limit;
+}
+
 /** Interpret `v` as a signed integer of the given width, as a JS number. */
 export function toSigned(v: bigint, width: number): number {
   // signExtend yields the 64-bit two's-complement value; narrowing to a JS

@@ -89,15 +89,9 @@ jobs:
   boot-smoke:
     name: boot smoke test
     runs-on: ubuntu-latest
-    # There is no CLI yet: src/cli.ts is Phase 1 work and does not exist. This job
-    # is gated on the file appearing rather than deleted, so that the day the
-    # interpreter and boot path land, the smoke test starts running without anyone
-    # having to remember to re-add it.
-    #
-    # Removing the gate is the correct move at that point, not before: a smoke test
-    # that is present but always failing trains everyone to ignore red builds,
-    # which is worse than having no smoke test at all.
-    if: false
+    # The gate that used to sit here is removed. src/cli.ts now exists, the
+    # interpreter executes the boot sector, and this job can actually fail -
+    # which is the only reason a smoke test is worth having.
     steps:
       - name: Check out the repository
         uses: actions/checkout@v4
@@ -119,6 +113,51 @@ jobs:
           if [ "$status" -ne 0 ]; then
             echo "::error::boot smoke test failed with exit code $status"
             exit "$status"
+          fi
+
+  desktop-smoke:
+    name: desktop is visible and responsive
+    runs-on: ubuntu-latest
+    # Asserts the three things a screenshot cannot: that the desktop draws, that a
+    # keystroke changes the frame buffer, and that the compositor is examining far
+    # less than the whole screen. A build that renders a correct-looking image with
+    # a broken compositor passes an image comparison and fails this.
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run the desktop and check the frames
+        run: |
+          set +e
+          node --experimental-strip-types --no-warnings src/cli.ts gui \
+            --frames 120 --keys "Tab/2/type:ver/Enter/F1/F1" --check
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::desktop smoke test failed with exit code $status"
+            exit "$status"
+          fi
+
+      - name: Render the desktop to images
+        run: |
+          node --experimental-strip-types --no-warnings src/cli.ts gui \
+            --frames 120 --every 60 --scale 3 --out docs/assets \
+            --keys "Tab/type:ver/Enter" --boot-frame
+
+      - name: Fail if the committed images differ
+        run: |
+          if ! git diff --quiet -- docs/assets; then
+            echo "::error::docs/assets is out of date. Re-run the command above and commit the result."
+            git --no-pager diff --stat -- docs/assets
+            exit 1
           fi
 
   assets:

@@ -13,7 +13,7 @@ QEMU, no disk image, no bootloader, and nothing that can touch your hardware.
 
   x86-64 machine model, running on Node
 
-  Status 253/253 tests passing   tsc --noEmit clean
+  Status 373/373 tests passing   tsc --noEmit clean   boots and runs a desktop
   Boots on Node. Not on bare metal. See README.
 ```
 
@@ -146,35 +146,100 @@ $ node --experimental-strip-types -e '<decode a byte stream>'
   <img src="docs/assets/console-shell.png" alt="VerixOS console with a shell prompt" width="640">
 </p>
 
-**Test suite:** 253 tests, all passing.
+**Test suite:** 373 tests, all passing.
 
 ```text
 $ npm test
 
 TAP version 13
 ...
-1..24
-# tests 253
+1..271
+# tests 373
 # suites 24
-# pass 253
+# pass 373
 # fail 0
 ```
 
+## The desktop
+
+The kernel boots on real machine code and then runs a windowing desktop. There is
+no screenshot in this README of a picture that was not produced by running it.
+
+<p align="center">
+  <img src="docs/assets/boot.png" alt="The VerixOS boot log, captured from the VGA text framebuffer" width="640">
+</p>
+
+The image above is the text-mode console as the adapter rendered it, captured
+before the kernel takes the frame buffer for the compositor. It is produced by a
+512-byte boot sector assembled by this project's own assembler and executed by
+its own interpreter: the sector asks the firmware for sectors off a disk image,
+jumps to stage 2, which programs the PIT, unmasks the timer and keyboard lines on
+the 8259 pair, enables interrupts and publishes a hand-off word, and the kernel
+takes it from there.
+
+<p align="center">
+  <img src="docs/assets/frame-0150.png" alt="The VerixOS desktop: dock, terminal, system monitor and about windows" width="640">
+</p>
+
+The desktop above is the same machine at frame 150, after a scripted run of
+`Tab/type:ver/Enter`. Everything on it is reachable: the clock reads the PIT's
+tick count, the monitor reads the CPU's retired-instruction counter and graphs
+the measured cost of each frame, and typing goes to the window that has focus.
+
+### Try it
+
+```text
+$ npm start boot                      # run the boot sequence, print what it did
+$ npm start gui --frames 120 --out out   # render frames to PNG
+$ npm start gui --keys "Tab/type:ver/Enter" --check   # assert it responds
+$ npm start run examples/hello.asm --trace            # assemble, execute, trace
+```
+
+`npm start gui --check` is the testable form of the whole thing. It exits non-zero
+unless every frame drew something, the boot handed over, and no frame was idle.
+
+### Is it actually efficient?
+
+The compositor keeps two buffers and copies only the pixels that differ inside
+the rectangles the desktop damaged. `present()` reports both how many pixels it
+*wrote* and how many it *examined*, and the ratio is asserted in the test suite
+rather than claimed in prose:
+
+```text
+$ npm start gui --frames 120 --stats
+
+pixels written  118665
+pixels examined 4332910
+change ratio    2.74%
+idle frames     0
+```
+
+A compositor that redrew the whole screen every frame would produce identical
+pictures and a change ratio of 100%. That difference is the only claim about the
+compositor that means anything, which is why it is a number in a test and not a
+sentence in a README.
+
 ## What does not work yet
 
-The kernel itself has not been written. There is no instruction interpreter, so
-the decoder's output is not yet executed. There is no boot sector, no long-mode
-transition, no page walker, no heap, no scheduler, no filesystem, no shell, and
-no desktop.
+The kernel runtime is TypeScript that runs on the machine model, not machine code
+that the interpreter executes. Everything below the boundary — the boot sector,
+stage 2, and any program you assemble — is real x86-64 executed by this project's
+own decoder and interpreter; everything above it is the kernel's own runtime.
+`docs/architecture.md` documents where that line falls and why.
 
-The assembler does exist and is complete, which is worth separating from the
-above: assembly source is assembled to real machine code today, and that code
-decodes back to the same instructions. What is missing is anything that
-*executes* it. `npm start` currently exits with a "module not found" for
-`src/cli.ts` because that file does not exist yet.
+What is genuinely absent: a long-mode transition, a page walker, a physical or
+virtual memory manager, a kernel heap, a preemptive scheduler, a filesystem, and
+a syscall entry path. The interpreter has no IDT, so hardware interrupts are
+serviced by the firmware's ROM handlers rather than by guest-installed gates, and
+a guest that installs its own IDT will find `lgdt` and `lidt` work but nothing
+dispatching through them.
 
-This is version 0.1.0 of a project at roughly 20% of its first milestone. It is
-a real foundation with a documented plan on top of it, not a finished operating
+Also absent: x87, SSE, AVX, `shld`/`shrd`, `pusha`/`popa`, `bswap`, and the
+three-byte opcode maps. The assembler refuses them rather than emitting something
+that would decode to a different instruction.
+
+This is version 0.1.0 of a project at roughly 40% of its first milestone. It is
+a running system with a documented plan behind it, not a finished operating
 system, and it is better to say so here than to have you discover it after
 cloning.
 
@@ -190,27 +255,31 @@ and documented, not yet written.
 | Register file and flags | Real | All sub-register widths, REX-aware byte registers |
 | Physical memory bus | Real | Bounds-checked, MMIO regions, register devices |
 | Port I/O bus | Real | Overlapping claims rejected at registration |
-| Instruction decoder | Real | Prefix/ModRM/SIB, both `0F` system groups, far pointers, LOCK |
+| Instruction decoder | Real | Prefix/ModRM/SIB, both `0F` system groups, far pointers, LOCK, `0F 20`/`22` |
+| **Instruction interpreter** | Real | Executes decoded instructions; every assertion is on registers, flags, memory or ports |
+| **Assembler** | Real | Full x86-64 assembler; round-trip-checked against the decoder |
+| **BIOS / firmware** | Real | `int 10h/11h/12h/13h/14h/15h/16h/17h/1Ah`, set-1 scancode translation |
+| **Machine** | Real | RAM, ports, devices, PIC-driven interrupts, PIT-timed |
+| **Boot sector and stage 2** | Real | 512-byte sector, `int 13h` load, PIT and PIC programming, hand-off |
+| **CLI** | Real | `boot`, `gui`, `run`, `screen`, `info`; `--check` gates CI |
+| **Compositor** | Real | Damage rectangles, double buffering, measured pixel counts |
+| **Desktop and shell** | Real | Dock, windows, focus, terminal, live system monitor |
 | 8259A PIC | Real | Dual-PIC pair with remapping and EOI |
 | 8254 PIT | Real | All six modes, read-back command, counter latching |
 | 16550 UART | Real | Interrupt and FIFO registers, divisor latch |
 | PS/2 keyboard | Real | Scancode set 1, controller status, translate |
 | VGA adapter | Real | Text, `0x12`, `0x0E`, Mode X, `0x13`, DAC, host rendering |
 | Font ROM | Real | Hand-authored 8x8 CP437 glyphs, 8x16 derived |
-| **Instruction interpreter** | Planned | Decoder output is not executed yet |
-| **Assembler** | Real | Full x86-64 assembler; round-trip-checked against the decoder |
-| **Boot sector and stage 2** | Planned | No long-mode transition exists |
-| **GDT / IDT / segmentation** | Partial | Architectural constants exist; no tables built |
-| **Paging and the page walker** | Partial | PTE layout and CR bits exist; no translation |
+| **GDT / IDT / segmentation** | Partial | `lgdt`/`lidt`/`lldt`/`ltr`/`sldt`/`str` execute against a flat model; no gates |
+| **Paging and the page walker** | Partial | PTE layout and CR bits exist; `mov cr0..cr4` executes; no translation |
 | **Physical memory manager** | Planned | Constants only |
 | **Virtual memory manager** | Planned | Constants only |
 | **Kernel heap** | Planned | Not started |
-| **Interrupt dispatch** | Planned | Vectors defined; no gate handling |
+| **Interrupt dispatch** | Partial | Vectors defined, firmware ROM handlers; no IDT gates |
 | **Scheduler, tasks** | Planned | Not started |
-| **Syscall ABI** | Partial | Numbers fixed; no entry path |
+| **Syscall ABI** | Partial | `syscall`/`sysret` execute against MSRs; no kernel entry |
 | **VFS and filesystem** | Planned | Not started |
 | **Driver model** | Planned | Device models exist; the model above them does not |
-| **Shell and desktop** | Planned | Not started |
 
 ## Repository layout
 
@@ -219,8 +288,11 @@ verixos/
 ├── src/
 │   ├── arch/        Architectural constants, register file, instruction decoder
 │   ├── asm/         Assembler: lexer, parser, encoder, label resolution
-│   ├── machine/     Memory bus, port I/O bus, device models
-│   └── cli.ts       Entry point                    [not yet written]
+│   ├── boot/        Boot sector, stage 2, and the disk-image builder
+│   ├── cpu/         Instruction interpreter
+│   ├── kernel/      Compositor, desktop, applications, the kernel runtime
+│   ├── machine/     Memory bus, port I/O bus, firmware, device models
+│   └── cli.ts       Entry point
 ├── tools/           Screenshot generator, bootable image builder
 ├── tests/           Node test-runner suites
 ├── docs/            ABI reference, roadmap, rendered assets

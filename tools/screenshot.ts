@@ -27,7 +27,7 @@ const PNG_SIGNATURE = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a,
 /** CRC-32, as PNG defines it. Table built once on first use. */
 let crcTable: Uint32Array | undefined;
 
-function crc32(data: Uint8Array): number {
+export function crc32(data: Uint8Array): number {
   if (!crcTable) {
     crcTable = new Uint32Array(256);
     for (let n = 0; n < 256; n++) {
@@ -45,7 +45,7 @@ function crc32(data: Uint8Array): number {
   return (crc ^ 0xffff_ffff) >>> 0;
 }
 
-function chunk(type: string, body: Uint8Array): Uint8Array {
+export function chunk(type: string, body: Uint8Array): Uint8Array {
   const out = new Uint8Array(12 + body.length);
   const view = new DataView(out.buffer);
   view.setUint32(0, body.length);
@@ -63,7 +63,7 @@ function chunk(type: string, body: Uint8Array): Uint8Array {
  * is irrelevant and the branch would only be a place to get the byte order
  * wrong.
  */
-function encodePng(pixels: Uint32Array, width: number, height: number): Uint8Array {
+export function encodePng(pixels: Uint32Array, width: number, height: number): Uint8Array {
   const stride = width * 3;
   const raw = new Uint8Array((stride + 1) * height);
   for (let y = 0; y < height; y++) {
@@ -185,4 +185,9 @@ function main(): void {
   save(directory, 'console-attributes', colours);
 }
 
-main();
+// Only run when invoked directly. `verix` imports `encodePng` from this file, and
+// an unconditional `main()` would make importing a PNG encoder write six images to
+// `boot/` as a side effect of asking for help.
+if (process.argv[1] !== undefined && import.meta.url.endsWith(process.argv[1].replace(/\\/g, '/').split('/').pop() ?? '')) {
+  main();
+}

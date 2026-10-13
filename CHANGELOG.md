@@ -11,6 +11,160 @@ not guaranteed.
 
 ## [Unreleased]
 
+### The system boots, and there is a desktop
+
+The largest change since the assembler landed: machine code is now executed. A
+512-byte boot sector, written in assembly and assembled by this project, loads
+stage 2 off a disk image through the firmware's `int 13h`; stage 2 programs the
+PIT, unmasks the timer and keyboard lines on the 8259 pair, enables interrupts and
+publishes a hand-off word; the kernel runtime takes it from there and runs a
+windowing desktop at 320x200.
+
+Every new subsystem's correctness claim is a measurement rather than a sentence.
+The compositor reports how many pixels it wrote and how many it examined, and the
+test suite asserts the ratio, so a regression to "redraw the whole screen every
+frame" fails a build instead of passing a screenshot review.
+
+### Added
+
+**Instruction interpreter** (`src/cpu/interpreter.ts`)
+
+- Executes decoded instructions against the register file, flags, memory bus and
+  port bus. Covers the data-movement, ALU, shift, rotate, atomic, control-flow,
+  string, system and I/O-string families the assembler can produce.
+- A REP string primitive is one instruction: the whole iteration runs inside a
+  single fetch, so RIP advances by the instruction's length once, not once per byte.
+- Descriptor-table loads and stores read and write the six- or ten-byte
+  pseudo-descriptor the SDM specifies rather than a word of the operand size.
+- `SYSCALL`/`SYSCRET` enter and leave through `IA32_LSTAR` as long mode does, so
+  the guest runs its own entry stub rather than calling a host function.
+- An MSR the kernel has not programmed faults, because that is how feature
+  discovery is supposed to work.
+
+**Firmware** (`src/machine/firmware.ts`)
+
+- `int 10h` (video: modes, cursor, scroll, teletype, string writes),
+  `int 11h`, `int 12h`, `int 13h` (CHS read and verify), `int 14h`, `int 15h`,
+  `int 16h` with set-1 scancode-to-ASCII translation, `int 17h` and `int 1Ah`.
+- The BIOS data area is a live window onto the same RAM the bus serves, so
+  `int 11h` and a guest reading `0x410` cannot disagree.
+- Power-on self test primes the keyboard controller and discards its
+  identification bytes, so the first keystroke is not lost and the first `int 16h`
+  does not read the keyboard's model code as a character.
+
+**Machine** (`src/machine/machine.ts`)
+
+- Wires RAM, the port bus, the VGA aperture, the PIC pair, the PIT, the PS/2
+  keyboard and the UART, and closes the loop from firmware back into the CPU.
+- Time advances because instructions were executed: one instruction costs one
+  oscillator cycle at the PIT's real 1.193182 MHz. A spinning guest produces
+  ticks; a halted one produces none.
+- `runBoot` reads the console out of the adapter and the hand-off out of memory,
+  and refuses to continue if stage 2 did not finish.
+
+**Boot path** (`src/boot/`)
+
+- `boot.asm`: 512 bytes at `0x7C00`, ending in the `0x55AA` signature, loading
+  stage 2 through `int 13h` and jumping to it.
+- `stage2.asm`: programs the PIT for 100 Hz, unmasks IRQ0 and IRQ1, enables
+  keyboard scanning with the two-write PS/2 sequence, enables interrupts and
+  publishes the hand-off word.
+
+**Kernel, compositor and desktop** (`src/kernel/`)
+
+- Damage-tracked compositor with double buffering, rectangle coalescing that
+  merges overlapping damage but keeps distant damage separate, and a measured
+  `written`/`examined` count on every present.
+- Window manager with a dock, focus cycling, keyboard-moved windows, bevelled
+  frames and a status bar; three applications: a terminal that runs real commands,
+  a live system monitor that graphs measured frame cost, and an about window.
+- `parseKeyScript` turns `Tab/type:ver/Enter` into keystrokes, so a recorded run
+  is reproducible.
+
+**CLI** (`src/cli.ts`)
+
+- `verix boot`, `verix gui`, `verix run`, `verix screen`, `verix info`.
+- `verix gui --check` turns "the desktop is visible and responsive" into an exit
+  code. CI runs it, so the claim is gated rather than asserted.
+
+### Fixed
+
+Twenty-three real bugs, each of which produced plausible output and would have
+passed a test that only checked that something happened.
+
+**Interpreter**
+
+- A 16-bit or 8-bit register write zeroed the upper bits of the register. The
+  SDM leaves them undefined and in practice preserved; writing them through cost
+  any pointer held above 16 bits its high half on every `mov ax, ...`.
+- `sar` shifted in zeros. `signExtend` returns the 64-bit *pattern* of a negative
+  number, and `>>` on that pattern is a logical shift, so `sar` behaved as `shr`
+  for every negative input. A test that shifted by four passed by luck; shifting
+  by one did not.
+- Signed `imul`, `idiv` and `div` operated on the same patterns, so two negative
+  operands produced a huge positive product. `signedValue` now separates "the
+  value" from "the bits".
+- `inc` and `dec` cleared the carry flag, because they share the adder with `add`
+  and nothing restored it.
+- `adc` and `sbb` reported the wrong auxiliary carry when the low nibble of the
+  second operand was `0x0f`, because folding the carry in first ripples it out of
+  the nibble.
+- `rcl` and `rcr` asked `widthMask` for 9, 17, 33 and 65 bits and threw.
+- A shift count of zero cleared the carry flag instead of leaving it alone.
+- `in` and `out` used the mode's default operand size rather than the transfer
+  width, so `in al, dx` in long mode put four bytes on the bus.
+- The port operand of `in`/`out` was decoded at the data width, printing `dl`
+  where the architecture says `DX`.
+- `mov ds, ax` faulted, which made every real-mode boot routine impossible.
+- Control-register moves (`0F 20`/`0F 22`) did not decode at all, though the
+  assembler could emit them.
+- `jmpf`, `callf`, `iret`, segment push/pop, string I/O, the descriptor-table
+  instructions, `smsw`/`lmsw`, `verr`/`verw`, `sldt`/`str`, `xgetbv`/`xsetbv`,
+  `swapgs`, `invlpg`, `rdmsr`/`wrmsr`, `syscall`/`sysret` and the no-op system
+  instructions all decoded and then faulted when executed.
+
+**Decoder**
+
+- The `B0+r` family names its register in the opcode and has no ModRM byte, so it
+  bypassed the high-byte rule: `B4 11` decoded as `mov spl, 0x11` rather than
+  `mov ah, 0x11`, a different instruction that needs a REX prefix.
+- Descriptor-table operands were reported at 16 bits. They are pseudo-descriptors
+  of six or ten bytes, so an executor would have fetched two bytes where the
+  hardware fetches ten.
+
+**Assembler**
+
+- `.data` was placed at the origin instead of after `.text`. The emitted image had
+  the right length and every string overwrote instructions: a boot sector built
+  that way boots and then executes its own message text.
+- A second reference to the same forward label was treated as a final address.
+  `pending` is a `Set`, so `call print` twice added nothing new, the layout pass
+  concluded nothing had been guessed, and the range check measured a displacement
+  to address zero. Any routine calling a helper more than once failed to
+  assemble.
+- `mov eax, 0xdeadbeef` and `mov al, -1` were both refused. Those immediates fill
+  the destination rather than extending it, so the full unsigned range applies;
+  the decoder accepted what the encoder would not, which broke the round trip.
+- `cwd` assembled as `66 99`, which is `cwde`. The `98`/`99` family is the one
+  encoding decided by the mode's default operand size, and it had been written
+  down as a fixed byte sequence.
+- A bare symbolic address in a non-64-bit mode was treated as RIP-relative and
+  refused, which made `mov word [handoff], magic` impossible in real mode.
+
+**Devices**
+
+- The PS/2 keyboard claimed only ports `0x60`-`0x61`, so the controller's command
+  register at `0x64` faulted. Enabling scanning needs that register: a boot sector
+  that cannot reach it can never receive a keystroke.
+- Importing the screenshot tool ran it, so anything that wanted its PNG encoder
+  wrote six images as a side effect.
+
+### Documentation
+
+- README: the status table, the test count and the visuals now describe a system
+  that boots and runs, and the "what does not work yet" section names what is
+  genuinely absent rather than what was absent last month.
+
 ### Instruction set: decoder completion and a full assembler
 
 The instruction decoder was brought to coverage of every instruction class the

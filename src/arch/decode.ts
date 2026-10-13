@@ -111,8 +111,31 @@ export type Operand =
        * to reproduce it has to guess.
        */
       readonly operandWidth: number;
+      /**
+       * True when the assembly language has no size keyword for this operand.
+       *
+       * Two families need it. A descriptor-table operand names a *pseudo-descriptor*:
+       * a two-byte limit followed by a four- or eight-byte base, six bytes in the
+       * legacy modes and ten in long mode. That is not a 16-bit value, not the
+       * operand size and not expressible by any of the size keywords, so printing
+       * one of them states a width the instruction does not use, and the decoder
+       * reading it back would fetch two bytes when the hardware fetches ten.
+       * `invlpg` is the same problem in miniature: its operand is an address, not a
+       * value, and `invlpg byte [rax]` is not a spelling any assembler accepts.
+       */
+      readonly unsized?: boolean;
     }
   | { readonly kind: 'rel'; readonly target: bigint }
+  /**
+   * A control register: CR0-CR15, or DR0-DR15 with the debug flag set.
+   *
+   * Separate from `reg` because a control register is not in the general-purpose
+   * file, has no width of its own beyond 64 bits, and is named differently in
+   * assembly from anything the general-purpose table produces. `mov rax, cr0` and
+   * `mov rax, 0` are different instructions that would print identically if the
+   * control register were folded into an ordinary register operand.
+   */
+  | { readonly kind: 'cr'; readonly index: number; readonly debug?: boolean }
   /**
    * A far pointer: `segment:offset`.
    *
@@ -1350,8 +1373,16 @@ export class InstructionDecoder {
 
       case 0xb0: case 0xb1: case 0xb2: case 0xb3:
       case 0xb4: case 0xb5: case 0xb6: case 0xb7: {
-        const reg = (opcode & 7) | (this.rexB << 3);
-        return this.result(Mnemonic.MOV, [this.gpr(reg, 8), { kind: 'imm', value: this.immUnsigned(8), width: 8 }]);
+        // `mov r8, imm8` names its register in the low three bits of the opcode
+        // and has no ModRM byte at all, so `byteOperand` is the only thing that
+        // can tell `B4` from `B0` meaning AH rather than SPL. Going through `gpr`
+        // here - which is what this used to do - decodes `B4 11` as
+        // `mov spl, 0x11`, a different instruction that needs a REX prefix to
+        // mean what it says.
+        return this.result(Mnemonic.MOV, [
+          this.byteOperand((opcode & 7) | (this.rexB << 3)),
+          { kind: 'imm', value: this.immUnsigned(8), width: 8 },
+        ]);
       }
 
       case 0xb8: case 0xb9: case 0xba: case 0xbb:
@@ -1478,8 +1509,12 @@ export class InstructionDecoder {
       }
       case 0xec: case 0xed: {
         const width = opcode === 0xec ? 8 : os;
-        // The port operand is named DX at every data width - see the note on the OUT side.
-        return this.result(Mnemonic.IN, [this.gpr(Reg.AX, width), this.gpr(Reg.DX, width)]);
+        // The port operand is named DX at every data width. The port number lives
+        // in the low half of DX and the high half is not part of it, so printing
+        // `dl` for an 8-bit transfer would be self-consistent nonsense that does
+        // not re-assemble - the assembler accepts only DX or an immediate as a
+        // port, because DX is the only register the encoding reads.
+        return this.result(Mnemonic.IN, [this.gpr(Reg.AX, width), this.gpr(Reg.DX, os)]);
       }
       case 0xe6: case 0xe7: {
         const width = opcode === 0xe6 ? 8 : os;
@@ -1487,11 +1522,8 @@ export class InstructionDecoder {
       }
       case 0xee: case 0xef: {
         const width = opcode === 0xee ? 8 : os;
-        // The port operand is named DX whatever the data width, since the port number is in
-        // the low half of DX and the high half is not part of it. Printing DL here
-        // would be self-consistent nonsense and would not re-assemble, because the
-        // assembler accepts only DX or an immediate as a port.
-        return this.result(Mnemonic.OUT, [this.gpr(Reg.DX, width), this.gpr(Reg.AX, width)]);
+        // The same rule on the OUT side: DX is named at every data width.
+        return this.result(Mnemonic.OUT, [this.gpr(Reg.DX, os), this.gpr(Reg.AX, width)]);
       }
 
       case 0xf4:
@@ -1759,11 +1791,42 @@ export class InstructionDecoder {
           }
           const mnemonic = DESCRIPTOR_TABLE_0F01[m.reg & 7];
           if (mnemonic === undefined || !m.mem) return this.result(Mnemonic.UNIMPLEMENTED, []);
-          // The operand of a descriptor-table store holds a *limit and base*, not a
-          // value of the operand size: 6 bytes in legacy modes and 10 in 64-bit mode.
-          // So its width is not read off the prefixes, and it is reported at 16 bits
-          // rather than invented.
-          return this.result(mnemonic, [this.rmFrom(m, 16)]);
+
+          // INVLPG names an address rather than a value, so it is unsized. The
+          // four descriptor-table instructions name a *pseudo-descriptor*: a
+          // two-byte limit followed by a base of four or eight bytes, which is
+          // six bytes in the legacy modes and ten in long mode. That width is
+          // fixed by the instruction and has nothing to do with any prefix -
+          // reporting it at the operand size, or at 16 bits as an earlier
+          // reading did, makes the executor fetch the wrong number of bytes and
+          // the disassembler print a size keyword that means nothing.
+          if (mnemonic === Mnemonic.INVLPG) {
+            return this.result(mnemonic, [{ ...m.mem, operandWidth: 8, unsized: true }]);
+          }
+          const pseudoBytes = this.ctx.mode === CpuMode.LONG64 ? 10 : 6;
+          return this.result(mnemonic, [{ ...m.mem, operandWidth: pseudoBytes * 8, unsized: true }]);
+        }
+      case 0x20: case 0x21: case 0x22: case 0x23: {
+          // `mov r64, crN`, `mov r64, drN`, and the two store directions.
+          //
+          // Unlike every other MOV in the map these do not reverse their operands:
+          // the SDM puts the control register in the ModRM `reg` field and the
+          // general-purpose register in `r/m` for *both* directions, so the
+          // operand order is decided by the opcode, not by which side is written.
+          //
+          // The debug flag is the opcode's own bit, not a ModRM bit: 0F 20/0F 22
+          // are the control registers and 0F 21/0F 23 the debug registers. The
+          // index is the ModRM reg field with REX.R extending it, which is what
+          // makes `cr8` reachable through the otherwise-unused fourth bit.
+          const m = this.readModrm();
+          const debug = opcode === 0x21 || opcode === 0x23;
+          const index = (m.reg & 7) | (this.rexR << 3);
+          if (!m.isRegister) return this.result(Mnemonic.UNIMPLEMENTED, []);
+          const cr: Operand = { kind: 'cr', index, debug };
+          const gpr = this.gpr(m.rm & 7, 64);
+          return opcode === 0x20 || opcode === 0x21
+            ? this.result(Mnemonic.MOV_CR, [gpr, cr])
+            : this.result(Mnemonic.MOV_CR, [cr, gpr]);
         }
       case 0xa0: case 0xa8:
         return this.result(Mnemonic.PUSH_FS, []);
@@ -2057,10 +2120,17 @@ export function formatOperand(op: Operand): string {
       // (`jmpf`) would need a second alias table to read back, and would leave the
       // operand looking like a bare expression, which the parser reads as a symbol.
       return `far 0x${op.segment.toString(16)}:0x${op.offset.toString(16)}`;
+    case 'cr':
+      // Printed as the register it names. `cr0` and `dr0` are the assembly
+      // spellings, and folding the debug flag into the number would produce
+      // `cr32`, which is a control register the SDM does not define.
+      return `${op.debug === true ? 'dr' : 'cr'}${op.index}`;
     case 'moffs':
       return `[0x${op.addr.toString(16)}]`;
     case 'mem': {
-      const keyword = `${sizeKeyword(op.operandWidth)} `;
+      // An unsized operand gets no keyword at all, which is both what the
+      // instruction means and what the assembler accepts back.
+      const keyword = op.unsized === true ? '' : `${sizeKeyword(op.operandWidth)} `;
       if (op.ripRelative) {
         const d = op.disp;
         return `${keyword}[rip${d < 0n ? `-0x${(-d).toString(16)}` : `+0x${d.toString(16)}`}]`;

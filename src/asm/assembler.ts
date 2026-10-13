@@ -234,10 +234,13 @@ export class Assembler {
       data: { base: null, bytes: [] },
     };
 
-    // Both sections start at the origin on the first pass, which makes every address
-    // wrong but consistently so. Relaxation then converges: a branch that appeared
-    // short at the origin either stays short once the addresses are real, or widens.
-    for (const section of SECTION_ORDER) state[section].base = this.origin;
+    // Sections are positioned by the `.text`/`.data` directives as they are met, not
+    // up front. Relaxation still converges: a pass that starts from the same bases
+    // and sees the same instruction sizes reaches the same layout, and a branch
+    // that appeared short at the origin either stays short once the addresses are
+    // real, or widens.
+    for (const section of SECTION_ORDER) state[section].base = null;
+    state.text.base = this.origin;
 
     const placed: Placed[] = [];
     const labelAddresses = new Map<string, bigint>();
@@ -250,6 +253,20 @@ export class Assembler {
      * empty, which by then means the name genuinely does not exist.
      */
     const pending = new Set<string>();
+    /**
+     * How many names have been answered with a guess in this pass.
+     *
+     * A Set cannot answer guessed on its own. A second reference to the *same*
+     * forward label - call print twice, which is what any routine that calls a
+     * helper more than once looks like - adds nothing to the set, so comparing sizes
+     * says "nothing new was guessed" and the layout pass treats a placeholder as a
+     * final address. The range check then measures a displacement to address zero,
+     * and a program that assembles perfectly well fails with "branch displacement of
+     * more than 16 bits" pointing at the second call rather than at anything wrong.
+     * Counting guesses instead of distinct names is what makes the test per
+     * statement, which is what it has to be.
+     */
+    let guesses = 0;
 
     /**
      * Addresses of `.local` occurrences seen so far this pass, in program order,
@@ -344,6 +361,7 @@ export class Assembler {
         // zero so the instruction can still be measured. If the layout settles while
         // this is still pending, the name really does not exist.
         pending.add(name);
+        guesses++;
         return 0n;
       }
 
@@ -352,6 +370,7 @@ export class Assembler {
       const constant = this.constants.get(name);
       if (constant !== undefined) return this.evaluateConstant(constant, symbols, undefined, new Set(), at);
       pending.add(name);
+      guesses++;
       return 0n;
     };
 
@@ -387,9 +406,25 @@ export class Assembler {
           mode = statement.mode === 16 ? CpuMode.REAL16 : statement.mode === 32 ? CpuMode.PROTECTED32 : CpuMode.LONG64;
           break;
 
-        case 'section':
+        case 'section': {
           section = statement.name;
+          if (state[section].base === null) {
+            // Place the section immediately after everything SECTION_ORDER puts
+            // before it. Starting every section at the origin instead - which is
+            // what this used to do - lays `.data` on top of `.text`: the strings
+            // and the code share addresses, so the emitted image has the right
+            // length but every string overwrites instructions. A boot sector
+            // assembled that way boots and then executes its own message text,
+            // which is about as confusing as a failure can be.
+            let base = this.origin;
+            for (const earlier of SECTION_ORDER) {
+              if (earlier === section) break;
+              base += BigInt(state[earlier].bytes.length);
+            }
+            state[section].base = base;
+          }
           break;
+        }
 
         case 'equ':
           this.constants.set(statement.name, statement.value);
@@ -468,7 +503,7 @@ export class Assembler {
         case 'instruction': {
           const address = here();
           const branchWidth = branches.get(ordinal)?.width ?? 8;
-          const guessesBefore = pending.size;
+          const guessesBefore = guesses;
           const result = encodeInstruction(statement, {
             filename: this.filename,
             line: statement.line,
@@ -489,7 +524,7 @@ export class Assembler {
           // width and judged again next pass. Widening is monotone, which means a
           // wrong promotion here could never be undone.
           let neededWidth: 8 | 16 | 32 | null = null;
-          const guessed = pending.size !== guessesBefore;
+          const guessed = guesses !== guessesBefore;
           if (result.branchWidth !== null && !guessed) {
             const near: 8 | 16 | 32 = mode === CpuMode.REAL16 ? 16 : 32;
             if (result.branchWidth === 8) {
@@ -508,6 +543,7 @@ export class Assembler {
                 const end = address + BigInt(result.bytes.length);
                 const delta = fixup.target - end;
                 if (delta < -32768n || delta > 32767n) {
+
                   // In 16-bit real mode there is no 32-bit branch displacement, so
                   // this is genuinely unreachable rather than something to widen to.
                   throw new AsmError(

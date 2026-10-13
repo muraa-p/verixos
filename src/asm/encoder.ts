@@ -295,6 +295,26 @@ const ADDRESS16: readonly (readonly [number, number, number])[] = [
   [6, -1, -1], // bare disp16
 ];
 
+/**
+ * The six sign-extending conversions of opcode `98` and `99`.
+ *
+ * They are the one family in the map whose encoding depends on the *mode's
+ * default operand size* rather than on anything the programmer wrote, because
+ * `98` alone means CBW at 16 bits, CWDE at 32 and CDQE at 64. A fixed byte
+ * sequence per mnemonic therefore cannot be right everywhere: the table that
+ * used to map `cwd` to `66 99` assembled correct code in long mode and CWDE in
+ * real mode, where `66 99` sign-extends EAX rather than producing DX:AX - a
+ * silent difference that a "did it assemble" check cannot see.
+ */
+const SIGN_EXTENSIONS: Readonly<Record<string, { opcode: number; size: 16 | 32 | 64 }>> = {
+  cbw: { opcode: 0x98, size: 16 },
+  cwde: { opcode: 0x98, size: 32 },
+  cdqe: { opcode: 0x98, size: 64 },
+  cwd: { opcode: 0x99, size: 16 },
+  cdq: { opcode: 0x99, size: 32 },
+  cqo: { opcode: 0x99, size: 64 },
+};
+
 /** Instructions with a bare opcode, no operands and no ModRM. */
 const SIMPLE_OPCODES: Readonly<Record<string, readonly number[]>> = {
   nop: [0x90],
@@ -311,12 +331,6 @@ const SIMPLE_OPCODES: Readonly<Record<string, readonly number[]>> = {
   sahf: [0x9e],
   pushf: [0x9c],
   popf: [0x9d],
-  cbw: [0x66, 0x98],
-  cwd: [0x66, 0x99],
-  cwde: [0x98],
-  cdq: [0x99],
-  cdqe: [0x48, 0x98],
-  cqo: [0x48, 0x99],
   ud2: [0x0f, 0x0b],
   cpuid: [0x0f, 0xa2],
   // XGETBV and XSETBV take no ModRM byte: the escape already spent it on the opcode
@@ -391,6 +405,26 @@ function fitsIn(value: bigint, width: number): boolean {
   return value >= min && value <= max;
 }
 
+/**
+ * Fold a negative immediate into the unsigned field it will be encoded into.
+ *
+ * `B8+rw id` and `B8+rd id` - and the `C6 /0` and `C7 /0` forms - take an imm16 or
+ * an imm32 that *fills* the destination rather than being sign-extended into it,
+ * so the field holds 2^16 and 2^32 distinct values, not half as many.
+ * `mov ax, -1` and `mov ax, 0xffff` are the same two bytes, and an encoder that
+ * accepts only the non-negative spelling refuses half of every byte pattern.
+ *
+ * This is not the same rule as a sign-extending immediate such as `C7 /0` at 64
+ * bits, where a value outside the signed imm32 range genuinely is
+ * unrepresentable and is refused rather than wrapped.
+ */
+function normaliseImmediate(value: bigint, width: number): bigint {
+  if (value >= 0n) return value;
+  const [min] = signedRange(width);
+  if (value < min) return value; // out of range; let the range check report it
+  return value + (1n << BigInt(width * 8));
+}
+
 function isSize(bits: number | undefined): bits is 8 | 16 | 32 | 64 {
   return bits === 8 || bits === 16 || bits === 32 || bits === 64;
 }
@@ -424,6 +458,12 @@ export class Encoder {
       this.requireNoOperands();
       this.frame.opcode.push(...simple);
       return this.result();
+    }
+
+    const extension = SIGN_EXTENSIONS[mnemonic];
+    if (extension !== undefined) {
+      this.requireNoOperands();
+      return this.encodeSignExtension(extension.opcode, extension.size);
     }
 
     if (mnemonic.startsWith('j') && CONDITION_NAMES.includes(mnemonic.slice(1))) {
@@ -727,6 +767,29 @@ export class Encoder {
     if (size === 8) return;
     const def = this.ctx.mode === CpuMode.REAL16 ? 16 : 32;
     if (size !== def && size !== 64) this.frame.prefixes.push(0x66);
+  }
+
+  /**
+   * `98` and `99` at a stated operand size.
+   *
+   * The prefix is derived from the mode rather than written down, because these
+   * two opcodes are the only ones whose meaning is decided entirely by the
+   * operand size that is otherwise implicit. REX.W selects the 64-bit form and
+   * does not exist outside long mode, so `cdqe` and `cqo` are refused elsewhere
+   * rather than emitted as a prefix a real-mode CPU would decode as nothing.
+   */
+  private encodeSignExtension(opcode: number, size: 16 | 32 | 64): EncodeResult {
+    const def = this.ctx.mode === CpuMode.REAL16 ? 16 : 32;
+    if (size === 64) {
+      if (this.ctx.mode !== CpuMode.LONG64) {
+        this.fail(`the 64-bit form of this conversion exists only in long mode; REX does not exist in ${this.ctx.mode === CpuMode.REAL16 ? 'real mode' : 'protected mode'}`);
+      }
+      this.frame.prefixes.push(0x48);
+    } else if (size !== def) {
+      this.frame.prefixes.push(0x66);
+    }
+    this.frame.opcode.push(opcode);
+    return this.result();
   }
 
   /**
@@ -1053,6 +1116,18 @@ export class Encoder {
 
   /** Choose between 16-bit and 32/64-bit addressing for a memory operand. */
   private memoryForm(mem: MemoryRef): RmForm {
+    // A bare symbolic address is RIP-relative only in long mode. RIP-relative
+    // addressing does not exist in the legacy modes at all - the SDM defines it
+    // only for 64-bit code - so there a symbol simply names an absolute address,
+    // which is what `mov word [handoff], magic` means in a boot sector. Refusing
+    // it instead would make the most ordinary line of real-mode code impossible
+    // to write, and would do so with an error message about an addressing mode
+    // the programmer never asked for.
+    //
+    // Nothing that already assembled changes: a RIP-relative operand outside long
+    // mode used to be an error, so there is no program whose meaning this could
+    // quietly alter.
+    const rip = mem.ripRelative === true && this.ctx.mode === CpuMode.LONG64;
     const baseIs16 = mem.base !== null && mem.base in ADDRESS16_REGISTERS;
     const indexIs16 = mem.index !== null && mem.index in ADDRESS16_REGISTERS;
 
@@ -1064,10 +1139,10 @@ export class Encoder {
       return this.memoryForm16(mem);
     }
 
-    // A 32-bit register name in real mode asks for 32-bit addressing, which needs the
-    // 0x67 address-size prefix. This encoder does not emit it, so say so rather than
-    // quietly using the 16-bit register of the same number.
-    if (this.ctx.mode === CpuMode.REAL16 && !mem.ripRelative) {
+    if (this.ctx.mode === CpuMode.REAL16) {
+      // A 32-bit register name in real mode asks for 32-bit addressing, which
+      // needs the 0x67 address-size prefix. This encoder does not emit it, so say
+      // so rather than quietly using the 16-bit register of the same number.
       const which = baseIs32Or64(mem.base) ? mem.base : mem.index;
       if (which !== null && which !== undefined) {
         this.fail(`'${which}' is a 32-bit address register, and reaching 32-bit addressing in real mode needs a 0x67 address-size prefix; write 'bx', 'bp', 'si' or 'di' instead`);
@@ -1075,11 +1150,10 @@ export class Encoder {
       return this.memoryForm16(mem);
     }
 
-    if (this.ctx.mode === CpuMode.REAL16 && !mem.ripRelative) {
-      return this.memoryForm16(mem);
+    if (mem.ripRelative === true && !rip) {
+      this.fail('RIP-relative addressing exists only in 64-bit mode; write the absolute address');
     }
-
-    return this.memoryForm32(mem);
+    return this.memoryForm32({ ...mem, ripRelative: rip });
   }
 
   /* ------------------------------------------------------------------ */
@@ -1766,8 +1840,9 @@ export class Encoder {
         const ref = this.byteRegister(dest.reg);
         this.setRex(false, 0, 0, ref.field, ref.needRex);
         this.setOpcode(0xb0 + (ref.field & 7));
-        // B0+r ib is unsigned.
-        this.setImmUnsigned(value, 1);
+        // B0+r ib fills the byte rather than extending it, so the field has 256
+        // values and both `mov al, 0xff` and `mov al, -1` are the same two bytes.
+        this.setImmUnsigned(normaliseImmediate(value, 1), 1);
         return this.result();
       }
       if (dest.kind !== 'memory') this.fail('invalid destination');
@@ -1775,8 +1850,9 @@ export class Encoder {
       this.setRex(false, 0, form.x, form.b, false);
       this.setOpcode(0xc6);
       this.setRm(form, 0);
-      // C6 /0 ib is unsigned, so `mov byte [rbx], 0xff` is two bytes, not four.
-      this.setImmUnsigned(value, 1);
+      // C6 /0 ib is unsigned, so `mov byte [rbx], 0xff` is two bytes, not four,
+      // and `mov byte [rbx], -1` is the same two bytes.
+      this.setImmUnsigned(normaliseImmediate(value, 1), 1);
       return this.result();
     }
 
@@ -1795,7 +1871,11 @@ export class Encoder {
       this.sizeOverridePrefix(size);
       this.setRex(false, 0, 0, reg.index, reg.needsRex);
       this.setOpcode(0xb8 + (reg.index & 7));
-      this.setImm(value, size === 16 ? 2 : 4);
+      // B8+rw and B8+rd fill the destination rather than extending it, so the
+      // full unsigned range is accepted. Only the REX.W form above is
+      // sign-extending, and that is the one that has to refuse out-of-range.
+      const width = size === 16 ? 2 : 4;
+      this.setImmUnsigned(normaliseImmediate(value, width), width);
       return this.result();
     }
 
@@ -1807,7 +1887,7 @@ export class Encoder {
     this.setRm(form, 0);
     // C7 /0 id: imm16 or imm32, sign-extended at 64 bits. There is no imm64 form of
     // MOV at all, which is why a full 64-bit constant has to come from memory.
-    this.setImmUnsigned(value, size === 16 ? 2 : 4);
+    this.setImmUnsigned(normaliseImmediate(value, size === 16 ? 2 : 4), size === 16 ? 2 : 4);
     return this.result();
   }
 
