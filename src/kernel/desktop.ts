@@ -19,7 +19,8 @@
  * device, and that number is measured rather than estimated.
  */
 
-import { COLOUR, Compositor, clip, moveRect, type Rect } from './compositor.ts';
+import { COLOUR, Compositor, CursorBuffer, clip, drawCursor, moveRect, type Rect } from './compositor.ts';
+import { drawMenu, ShellInput, dockRect, type DesktopLike } from './input.ts';
 import { ExtendedScanCode, ScanCode } from '../machine/devices/keyboard.ts';
 
 /* -------------------------------------------------------------------------- */
@@ -51,6 +52,29 @@ export function workArea(): Rect {
     y: LAYOUT.topBarHeight,
     width: LAYOUT.width - LAYOUT.dockWidth,
     height: LAYOUT.height - LAYOUT.topBarHeight - LAYOUT.statusBarHeight,
+  };
+}
+
+/** Vertical distance between the tops of two dock tiles. */
+const DOCK_TILE_PITCH = 34;
+
+/** Height of a dock tile. */
+const DOCK_TILE_HEIGHT = 28;
+
+/**
+ * Where the dock's tile for an application is.
+ *
+ * One definition, used both to paint the dock and to decide what a click landed on.
+ * Written twice it would drift, and the failure mode is a tile you can see and
+ * cannot click - which reads as a dead desktop rather than as a geometry bug.
+ */
+export function dockTile(index: number): Rect & { index: number } {
+  return {
+    index,
+    x: 5,
+    y: LAYOUT.topBarHeight + 6 + index * DOCK_TILE_PITCH,
+    width: LAYOUT.dockWidth - 12,
+    height: DOCK_TILE_HEIGHT,
   };
 }
 
@@ -201,6 +225,21 @@ export class Window {
   drawnRevision = -1;
   drawnFocus = false;
 
+  /**
+   * Stacking order. Higher is nearer the front.
+   *
+   * Kept on the window rather than by reordering the array, because the array
+   * index is what the keyboard focus order and the dock selection are tied to, and
+   * reordering it would make clicking a tile change which window Tab selects next.
+   */
+  z = 0;
+
+  /** Where the window was before it was maximised. */
+  restoreRect: Rect | undefined;
+
+  /** True when the window currently fills the work area. */
+  maximised = false;
+
   constructor(app: App, rect: Rect) {
     this.app = app;
     this.rect = rect;
@@ -221,6 +260,35 @@ export class Window {
       width: this.rect.width + windowBorder * 2,
       height: this.rect.height + windowBorder * 2 + LAYOUT.windowTitleHeight,
     };
+  }
+
+  /**
+   * The strip that carries the title, which is above the client area.
+   *
+   * One definition, used both to paint the title bar and to decide whether a click
+   * landed on it. When the two were written separately they drifted, and the result
+   * was a window that could be seen but not dragged - the title bar was drawn at
+   * one height and hit-tested at another, and the mismatch was invisible until
+   * somebody tried to use the window.
+   */
+  get titleBar(): Rect {
+    const frame = this.frame;
+    return {
+      x: frame.x + LAYOUT.windowBorder,
+      y: frame.y + LAYOUT.windowBorder,
+      width: frame.width - LAYOUT.windowBorder * 2,
+      height: LAYOUT.windowTitleHeight,
+    };
+  }
+
+  /**
+   * A point on the title bar, given a point in window coordinates.
+   *
+   * Used by the tests and by anything that needs to say "on the title bar" in terms
+   * of where the window *looks* to be rather than where its client area is.
+   */
+  titleBarPoint(dx: number, dy: number): { x: number; y: number } {
+    return { x: this.titleBar.x + dx, y: this.titleBar.y + dy };
   }
 
   /** The area the application may draw in. */
@@ -354,7 +422,7 @@ export interface DesktopOptions {
   readonly startMs?: number;
 }
 
-export class Desktop {
+export class Desktop implements DesktopLike {
   readonly compositor = new Compositor(LAYOUT.width, LAYOUT.height);
   readonly windows: Window[] = [];
   readonly apps: App[];
@@ -374,6 +442,19 @@ export class Desktop {
   private lastCount = '';
   private lastHelpVisible = false;
 
+  /** Where the pointer was last drawn, so it can be erased before redrawing. */
+  private pointerRect: Rect | undefined;
+
+  /**
+   * The pixels under the pointer.
+   *
+   * Sized from the sprite in `compositor.ts`. The reserved damage is two pixels
+   * larger on each side than this, which leaves room for the sprite to be resized
+   * without the damage and the saved area disagreeing - a mismatch that shows up
+   * as a one-pixel fringe of cursor left along a path.
+   */
+  private readonly cursorBuffer = new CursorBuffer(this.compositor, 16, 22);
+
   /** What has actually been drawn, as opposed to what needs drawing. */
   private lastDrawnDock = -1;
   private drawnHelp = false;
@@ -392,7 +473,18 @@ export class Desktop {
     // any of it works.
     this.focusIndex = 0;
     this.windows[0]!.focused = true;
+    for (const window of this.windows) window.z = window.app.id === 'terminal' ? 3 : window.app.id === 'monitor' ? 2 : 1;
+    this.input = new ShellInput(this);
   }
+
+  /**
+   * Pointer input.
+   *
+   * Constructed here rather than as a field initialiser because `input.ts` and this
+   * module refer to each other: a field initialiser would run during construction
+   * with the other module only half-evaluated.
+   */
+  readonly input: ShellInput;
 
   /** The focused window, if any. */
   get focusedWindow(): Window | undefined {
@@ -444,6 +536,21 @@ export class Desktop {
       window.app.update?.(dtMs);
     }
 
+    // The pointer is the one thing that moves whether or not the guest asks, so it
+    // damages its own rectangle and nothing else. Reserving room under it here is
+    // what stops a stationary pointer from being erased by the window it overlaps.
+    const pointer = this.input.pointer;
+    if (this.pointerRect !== undefined) this.compositor.damage(this.pointerRect);
+    const cursorWidth = 12;
+    const cursorHeight = 18;
+    this.pointerRect = {
+      x: Math.max(0, pointer.x - 2),
+      y: Math.max(0, pointer.y - 2),
+      width: cursorWidth + 4,
+      height: cursorHeight + 4,
+    };
+    this.compositor.damage(this.pointerRect);
+
     const machine = this.machineView();
     // The terminal's `time` command reports the same clock the top bar shows, so
     // there is one clock rather than two that could disagree.
@@ -464,8 +571,20 @@ export class Desktop {
 
     // Dock: only the selection indicator moves.
     if (this.dockSelection !== this.lastDockSelection) {
-      this.compositor.damage({ x: 0, y: LAYOUT.topBarHeight, width: LAYOUT.dockWidth, height: workArea().height });
+      this.compositor.damage(dockRect());
       this.lastDockSelection = this.dockSelection;
+    }
+
+    // A window that has moved or changed size has to repaint everything the old
+    // rectangle covered as well as the new one, or it leaves a copy of itself
+    // behind on the desktop.
+    for (let i = 0; i < this.windows.length; i++) {
+      const window = this.windows[i]!;
+      if (window.previous !== window.rect) {
+        this.compositor.damage(window.previous);
+        this.compositor.damage(window.frame);
+        window.previous = window.rect;
+      }
     }
 
     // Windows: focus changes repaint two title bars; an application repaints only
@@ -568,6 +687,25 @@ export class Desktop {
       this.drawStatusBar(machine);
     }
 
+    // Windows are drawn back to front, so a click lands on the one on top.
+    for (const window of this.windowsFrontToBack().reverse()) {
+      const index = this.windows.indexOf(window);
+      const focused = index === this.focusIndex;
+      if (window.drawnRevision !== window.app.revision || window.drawnFocus !== focused) {
+        this.drawWindow(window, focused, machine);
+        window.drawnRevision = window.app.revision;
+        window.drawnFocus = focused;
+      }
+    }
+    // The menu, if one is open, sits above every window.
+    this.drawMenu(this.compositor);
+    // The pointer is drawn last, and its damage was reserved before any of this.
+    // The pixels it covers are saved first and put back when it moves: the back
+    // buffer is never cleared, so without that the pointer would smear everywhere
+    // it had ever been.
+    this.cursorBuffer.moveTo(this.input.pointer.x, this.input.pointer.y);
+    drawCursor(this.compositor, this.input.pointer.x, this.input.pointer.y);
+
     const stats = this.compositor.present(target);
     // The monitor graph records what the frames have actually cost. It is fed
     // from the real measurement rather than estimated, which is the only way the
@@ -616,10 +754,10 @@ export class Desktop {
 
     switch (action.kind) {
       case 'focus-next':
-        this.setFocus(this.focusIndex + 1);
+        this.cycleFocus(1);
         return action;
       case 'focus-previous':
-        this.setFocus(this.focusIndex - 1);
+        this.cycleFocus(-1);
         return action;
       case 'close':
         if (window !== undefined) {
@@ -657,14 +795,209 @@ export class Desktop {
     }
   }
 
-  private setFocus(index: number): void {
-    if (this.windows.length === 0) return;
-    const next = ((index % this.windows.length) + this.windows.length) % this.windows.length;
+  /**
+ * Give a window the keyboard, or take it away.
+ *
+ * `-1` means *no window has focus*, which is a real state: clicking the desktop
+ * behind everything leaves the shell with nowhere to send a keystroke. It is kept
+ * distinct from wrapping deliberately, which is `cycleFocus`, because folding the
+ * two together makes "click the empty desktop" focus the last window in the list -
+ * a click on the background quietly handing the keyboard to a window the pointer
+ * was nowhere near.
+ */
+private setFocus(index: number): void {
     for (let i = 0; i < this.windows.length; i++) {
-      this.windows[i]!.focused = i === next;
+      this.windows[i]!.focused = i === index;
     }
-    this.focusIndex = next;
-    this.dockSelection = next;
+    this.focusIndex = index;
+    this.dockSelection = Math.max(0, index);
+  }
+
+  /**
+   * Move the focus by `step`, wrapping around the list.
+   *
+   * Wrapping is what makes Tab feel like Tab: the last window leads back to the
+   * first. Only the keyboard uses this, and it is a separate method so that
+   * `setFocus` can keep a single unambiguous meaning.
+   */
+  private cycleFocus(step: number): void {
+    if (this.windows.length === 0) return;
+    const count = this.windows.length;
+    const from = this.focusIndex < 0 ? 0 : this.focusIndex;
+    this.setFocus(((from + step) % count + count) % count);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Pointer-facing operations                                           */
+  /* ------------------------------------------------------------------ */
+
+  /** Put every piece of desktop state back where it started. */
+  reset(): void {
+    for (const window of this.windows) {
+      window.moveTo({ ...window.app.preferred });
+      window.previous = window.rect;
+      window.restoreRect = undefined;
+      window.maximised = false;
+      window.drawnRevision = -1;
+      window.drawnFocus = false;
+      window.focused = false;
+    }
+    this.focusIndex = 0;
+    this.dockSelection = 0;
+    if (this.windows[0] !== undefined) this.windows[0].focused = true;
+    for (const window of this.windows) {
+      window.z = window.app.id === 'terminal' ? 3 : window.app.id === 'monitor' ? 2 : 1;
+    }
+    this.helpVisible = false;
+    this.statusMessage = 'Tab focus  Enter open  F1 help';
+    this.lastClockText = '';
+    this.lastLoadBucket = -1;
+    this.lastDockSelection = -1;
+    this.lastStatus = '';
+    this.lastCount = '';
+    this.lastHelpVisible = false;
+    this.lastDrawnDock = -1;
+    this.drawnHelp = false;
+    this.primed = false;
+    this.pointerRect = undefined;
+    this.seenRevision.clear();
+    this.input.reset();
+    this.compositor.damageEverything();
+  }
+
+  /** Where each dock tile is, for hit testing. */
+  dockTiles(): ReadonlyArray<Rect & { index: number }> {
+    return this.apps.map((_app, index) => dockTile(index));
+  }
+
+  /** Windows nearest the front first, which is the order hit testing wants. */
+  windowsFrontToBack(): Window[] {
+    return [...this.windows].sort((a, b) => b.z - a.z);
+  }
+
+  appIds(): string[] {
+    return this.apps.map((app) => app.id);
+  }
+
+  appTitle(index: number): string {
+    return this.apps[index]?.title ?? '';
+  }
+
+  /** Give an application the keyboard, as the dock's tiles do. */
+  focusApp(index: number): void {
+    this.setFocus(index);
+    this.raiseApp(index);
+  }
+
+  focusWindow(window: Window | undefined): void {
+    if (window === undefined) {
+      this.setFocus(-1);
+      return;
+    }
+    const index = this.windows.indexOf(window);
+    if (index >= 0) this.setFocus(index);
+    this.raiseWindow(window);
+  }
+
+  raiseApp(index: number): void {
+    const window = this.windows[index];
+    if (window !== undefined) this.raiseWindow(window);
+  }
+
+  /** Bring a window to the front and damage the strip its title used to occupy. */
+  raiseWindow(window: Window): void {
+    const highest = this.windows.reduce((top, w) => Math.max(top, w.z), 0);
+    if (window.z === highest) return;
+    // The old front window's title bar is still painted with its accent, so it has
+    // to be repainted; leaving it is how a desktop ends up with two windows that
+    // both look focused.
+    this.compositor.damage(window.frame);
+    for (const other of this.windows) {
+      if (other !== window && other.z === highest) this.compositor.damage(other.frame);
+    }
+    window.z = highest + 1;
+    this.compositor.damage(window.frame);
+  }
+
+  /** Maximise to the work area, or restore to where the window was. */
+  toggleMaximise(window: Window): void {
+    const area = workArea();
+    if (window.maximised) {
+      const restore = window.restoreRect ?? window.rect;
+      window.moveTo(restore);
+      window.maximised = false;
+      window.restoreRect = undefined;
+    } else {
+      window.restoreRect = window.rect;
+      // The inset is the frame's own height above and around the client area, not
+      // an arbitrary margin. Insetting by a margin instead puts the title bar
+      // *behind* the top bar, and the window then has no title bar at all: it
+      // cannot be dragged, and it cannot be un-maximised by double-clicking it.
+      // The one thing a maximised window must always keep is its title bar.
+      const inset = LAYOUT.windowBorder + LAYOUT.windowTitleHeight;
+      window.moveTo({
+        x: area.x + inset,
+        y: area.y + inset,
+        width: area.width - inset * 2,
+        height: area.height - inset * 2,
+      });
+      window.maximised = true;
+    }
+    this.raiseWindow(window);
+    this.compositor.damage(window.frame);
+    this.statusMessage = window.maximised ? `${window.app.title} maximised` : `${window.app.title} restored`;
+  }
+
+  /** Close a window and give its pixels back to the desktop. */
+  closeWindow(window: Window): void {
+    const index = this.windows.indexOf(window);
+    if (index < 0) return;
+    const frame = window.frame;
+    this.windows.splice(index, 1);
+    this.compositor.damage(frame);
+    this.statusMessage = `Closed ${window.app.title}`;
+    this.setFocus(Math.min(this.focusIndex, this.windows.length - 1));
+  }
+
+  /** Pass the wheel on to an application that can use it. */
+  scrollWindow(window: Window, notches: number): void {
+    const app = window.app as App & { scroll?: (notches: number) => void };
+    if (typeof app.scroll !== 'function') return;
+    app.scroll(notches);
+  }
+
+  damageWindow(window: Window): void {
+    this.compositor.damage(window.frame);
+  }
+
+  damageEverything(): void {
+    this.compositor.damageEverything();
+  }
+
+  /** Damage the open menu, if there is one. */
+  damageMenu(): void {
+    const menu = this.input.openMenu;
+    if (menu === undefined) return;
+    this.compositor.damage({
+      x: menu.x - 2,
+      y: menu.y - 2,
+      width: 124,
+      height: menu.items.length * 11 + 8,
+    });
+  }
+
+  /**
+   * Draw the open menu, if there is one.
+   *
+   * Only the menu. The pointer is drawn by the frame loop after the pixels beneath
+   * it have been saved, and drawing it here as well would paint it twice - the
+   * second pass would be *outside* the saved rectangle, and those pixels would
+   * then never be put back, leaving a permanent cursor-shaped smear.
+   */
+  drawMenu(compositor: Compositor): void {
+    const menu = this.input.openMenu;
+    if (menu === undefined) return;
+    drawMenu(compositor, menu.x, menu.y, menu.items);
   }
 
   /* ------------------------------------------------------------------ */
@@ -698,8 +1031,7 @@ export class Desktop {
     this.compositor.verticalLine(LAYOUT.dockWidth - 1, dock.y, dock.height, COLOUR.hairline);
 
     for (let i = 0; i < this.apps.length; i++) {
-      const top = dock.y + 6 + i * 34;
-      const tile: Rect = { x: 5, y: top, width: LAYOUT.dockWidth - 12, height: 28 };
+      const tile = dockTile(i);
       const selected = i === this.dockSelection;
       this.compositor.bevel(tile, selected, selected ? COLOUR.panelLight : COLOUR.panel);
       if (selected) {
@@ -726,7 +1058,7 @@ export class Desktop {
     this.compositor.fillRect(frame, focused ? COLOUR.panel : COLOUR.panelDim);
     this.compositor.strokeRect(frame, focused ? COLOUR.bevelLight : COLOUR.hairline);
 
-    const title: Rect = { x: frame.x + 1, y: frame.y + 1, width: frame.width - 2, height: LAYOUT.windowTitleHeight };
+    const title = window.titleBar;
     this.compositor.fillRect(title, focused ? COLOUR.accent : COLOUR.panelDim);
     this.compositor.text8(
       title.x + 4,
@@ -855,12 +1187,24 @@ export class TerminalApp implements App {
     this.caretVisible = this.caretPhase < 500;
   }
 
+  /** How far back the visible history is scrolled. */
+  private scrollback = 0;
+
+  /** Scroll the transcript, for the mouse wheel. */
+  scroll(notches: number): void {
+    const next = Math.min(Math.max(this.scrollback + notches, 0), Math.max(0, this.lines.length - 1));
+    if (next === this.scrollback) return;
+    this.scrollback = next;
+    this.revision++;
+  }
+
   draw(ctx: AppContext): void {
     const { compositor, body } = ctx;
     compositor.fillRect(body, COLOUR.panel);
 
     const visible = Math.max(1, Math.floor((body.height - 4) / 9));
-    const history = this.lines.slice(-visible);
+    const end = Math.max(visible, this.lines.length - this.scrollback);
+    const history = this.lines.slice(Math.max(0, end - visible), end);
     history.forEach((line, i) => {
       compositor.text8(body.x + 3, body.y + 3 + i * 9, line.slice(0, 40), COLOUR.text, COLOUR.panel);
     });
@@ -906,6 +1250,7 @@ export class TerminalApp implements App {
   private run(command: string): void {
     const text = command.trim();
     this.lines.push(`> ${command}`);
+    this.scrollback = 0;
     switch (text) {
       case '':
         break;

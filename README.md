@@ -96,7 +96,9 @@ finished, and the [status table](#status) below says which.
   devices with correct sub-width merge semantics
 - A separate port I/O bus that rejects overlapping device claims
 - Device models: 8259A PIC (remapped to `0x20`/`0x28`), 8254 PIT (all six
-  modes, read-back, latching), 16550 UART, PS/2 controller with scan code set 1,
+  modes, read-back, latching), 16550 UART, PS/2 controller with scan code set 1
+  plus a PS/2 mouse on the auxiliary port (3- and 4-byte packets, wheel, 
+  `0xD4` command routing, IRQ12),
   and a VGA adapter covering text mode, mode `0x12`, mode `0x0E`, Mode X planar
   graphics, mode `0x13`, and DAC palette programming
 
@@ -154,16 +156,27 @@ $ npm test
 TAP version 13
 ...
 1..271
-# tests 373
+# tests 436
 # suites 24
-# pass 373
+# pass 436
 # fail 0
 ```
 
 ## The desktop
 
-The kernel boots on real machine code and then runs a windowing desktop. There is
-no screenshot in this README of a picture that was not produced by running it.
+The kernel boots on real machine code and then runs a windowing desktop. You can
+**click it**: `npm start -- live` opens a window you can move the pointer in,
+click icons with, drag windows by their title bars, right-click for a menu, and
+type into the terminal.
+
+```sh
+npm install
+npm start -- live
+```
+
+That boots the machine, shows the text-mode boot console for a moment, then serves
+the desktop over a local WebSocket and opens your browser on it. A screenshot is
+not a screenshot of a screenshot — it is a live machine you are driving.
 
 <p align="center">
   <img src="docs/assets/boot.png" alt="The VerixOS boot log, captured from the VGA text framebuffer" width="640">
@@ -186,17 +199,49 @@ The desktop above is the same machine at frame 150, after a scripted run of
 tick count, the monitor reads the CPU's retired-instruction counter and graphs
 the measured cost of each frame, and typing goes to the window that has focus.
 
+### What the pointer actually is
+
+It is not a cursor drawn by the browser. The pointer is a **PS/2 mouse** on the
+8042's auxiliary port, and a click travels the whole way a real one would:
+
+```text
+browser mousemove  ->  WebSocket  ->  Ps2Mouse.moveBy()      // counts, not pixels
+                   ->  3-byte packet with the sign in byte 0
+                   ->  IRQ12 on the slave PIC, via the master's cascade
+                   ->  int 33h / AX=0003  ->  CX:DX in pixels
+                   ->  ShellInput.hitTest() -> focus, drag, menu
+```
+
+`src/machine/devices/mouse.ts` assembles the packet, `src/machine/firmware.ts`
+answers `int 33h`, and `src/kernel/input.ts` decides what the click means. The
+browser half (`src/host/client.js`) sends **set 1 scan codes** for the keyboard and
+raw pixel coordinates for the mouse, and never sends key names — because a guest
+driver that received `"KeyA"` would have to reverse a translation table the
+hardware already performs.
+
+The host is a browser rather than a native window because a native window needs a
+GUI toolkit: a native dependency, a build step, and three different ones per
+platform. This project commits to zero runtime dependencies and "clone it and run
+it", and a browser is the one window system already installed everywhere, already
+handling DPI. The frame buffer goes out as **palette indices**, not RGB — 64 000
+bytes instead of 256 000, which is the adapter's real contents and makes the
+client's job a table lookup.
+
 ### Try it
 
 ```text
-$ npm start boot                              # run the boot sequence, print what it did
-$ npm start -- gui --frames 120 --out out     # render frames to PNG
+$ npm start -- live                             # the interactive desktop
+$ npm start boot                                # run the boot sequence, print what it did
+$ npm start -- gui --frames 120 --out out       # render frames to PNG
 $ npm start -- gui --keys "Tab/type:ver/Enter" --check
 $ npm start -- run examples/hello.asm --trace
 ```
 
-The `--` matters: `npm start gui --frames 120` does not work, because npm claims
-`--frames` as one of its own configuration options before the script ever sees it.
+Useful flags for `live`: `--fps 60`, `--port 8080`, `--boot-hold 0` (skip the boot
+console), `--no-open` (do not launch a browser).
+
+The `--` matters: `npm start live --fps 60` does not work, because npm claims
+`--fps` as one of its own configuration options before the script ever sees it.
 
 `npm start -- gui --check` is the testable form of the whole thing. It exits
 non-zero unless the boot handed over, every frame drew something, and no frame
@@ -210,11 +255,11 @@ the rectangles the desktop damaged. `present()` reports both how many pixels it
 rather than claimed in prose:
 
 ```text
-$ npm start gui --frames 120 --stats
+$ npm start -- gui --frames 120 --stats
 
-pixels written  118665
-pixels examined 4332910
-change ratio    2.74%
+pixels written  77369
+pixels examined 3500760
+change ratio    2.21%
 idle frames     0
 ```
 
@@ -222,6 +267,13 @@ A compositor that redrew the whole screen every frame would produce identical
 pictures and a change ratio of 100%. That difference is the only claim about the
 compositor that means anything, which is why it is a number in a test and not a
 sentence in a README.
+
+The kernel-drawn pointer is included in that number, and honestly so. Because the
+back buffer is never cleared between frames, a cursor drawn into it would stay
+there forever; `CursorBuffer` saves the pixels under the pointer and puts them
+back when it moves. The test measures the *difference* between a moving frame and
+a still one, so the cost of the pointer is a few hundred pixels rather than the
+30 000 the monitor window costs on its own.
 
 ## What does not work yet
 

@@ -56,6 +56,9 @@ export interface FirmwareHost {
   readonly disk: Uint8Array;
   /** BIOS data area at 0x400. */
   readonly bda: Uint8Array;
+  /** The mouse, for `int 33h`. */
+  readonly mouse: MouseView;
+
   /** PIT overflows since reset: the BIOS tick counter. */
   readonly timerTicks: number;
   /** Service calls serviced, for the `verix firmware` report. */
@@ -76,6 +79,8 @@ export const BIOS_VECTOR = {
   PRINTER: 0x17,
   TIME: 0x1a,
   REBOOT: 0x19,
+  /** The PS/2 mouse driver. Not an "IBM" vector, but universally this one. */
+  MOUSE: 0x33,
 } as const;
 
 /**
@@ -96,6 +101,26 @@ export const SCANCODE_ASCII: ReadonlyArray<number> = [
   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x46-0x4f
   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 13, 0, 0, // 0x50-0x59
 ];
+
+/**
+ * What `int 33h` needs from the mouse.
+ *
+ * An interface rather than the concrete class because the firmware has no business
+ * knowing how a motion packet is assembled - only what the pointer's position and
+ * button state are. That separation is what lets the pointer state used by the
+ * BIOS be the same state the device reports, rather than two that drift apart.
+ */
+export interface MouseView {
+  readonly x: number;
+  readonly y: number;
+  readonly buttons: number;
+  readonly enabled: boolean;
+  setReporting(enabled: boolean): void;
+  setHardwareCursorVisible(visible: boolean): void;
+  setBounds?(minX: number, minY: number, maxX: number, maxY: number): void;
+  setSpeed?(divisor: number): void;
+  setPosition?(x: number, y: number): void;
+}
 
 export class Firmware {
   /** Text cursor, in character cells. The VGA adapter has no cursor of its own. */
@@ -174,6 +199,9 @@ export class Firmware {
         break;
       case BIOS_VECTOR.TIME:
         serviced = this.time();
+        break;
+      case BIOS_VECTOR.MOUSE:
+        serviced = this.mouse33();
         break;
       case BIOS_VECTOR.REBOOT:
         throw new FirmwareHalt('the guest asked the firmware to reboot');
@@ -823,6 +851,147 @@ export class Firmware {
     for (const character of text) {
       this.teletype(character.codePointAt(0) ?? 0x20);
     }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* int 0x33 - the PS/2 mouse                                           */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * The mouse BIOS interface.
+   *
+   * This is the "IBM" or PS/2 mouse driver interface, and it is the one a
+   * protected-mode driver from the 1990s expects. Two of its behaviours matter
+   * enough to call out:
+   *
+   *  - **`AX=0000` returns 0xFFFF.** The usual sequence is "call init, test the
+   *    return for zero, and skip mouse support if it failed". Returning anything
+   *    else - including nothing - makes every such driver either hang or assume a
+   *    mouse that does not exist.
+   *  - **The cursor's position is in CX:DX in *pixels*, not counts.** A driver
+   *    that stores it as counts gets a pointer that moves at a fraction of the
+   *    speed the user expects, which is the single most common mouse-driver bug.
+   */
+  private mouse33(): boolean {
+    const { cpu } = this.host;
+    const function_ = this.ax & 0xffff;
+
+    switch (function_) {
+      case 0x0000: // initialise
+        this.mouseInitialised = true;
+        this.host.mouse.setReporting(true);
+        this.mouseReturnState();
+        cpu.regs.write(Reg.AX, 0xffffn);
+        return true;
+
+      case 0x0001: // show the hardware cursor
+        this.host.mouse.setHardwareCursorVisible(true);
+        return true;
+
+      case 0x0002: // hide the hardware cursor
+        // A graphics-mode driver almost always hides this and draws its own, so
+        // that the pointer can be any shape and can blend with the background.
+        this.host.mouse.setHardwareCursorVisible(false);
+        return true;
+
+      case 0x0003: // read the position and button state
+        this.mouseReturnState();
+        return true;
+
+      case 0x0004: // set the position
+        this.host.mouse.setPosition?.(
+          Number(cpu.regs.read(Reg.CX) & 0xffffn),
+          Number(cpu.regs.read(Reg.DX) & 0xffffn),
+        );
+        return true;
+
+      case 0x0005: // read the button state
+        this.mouseReturnState();
+        // All three buttons, in the device's own order: bit 0 left, bit 1 right,
+        // bit 2 middle. Masking to two bits would hide the middle button from a
+        // guest that has one, which is the same as a middle click never arriving.
+        cpu.regs.write(Reg.BX, BigInt(this.host.mouse.buttons & 0x07));
+        return true;
+
+      case 0x0006: // set the bounds
+        // BX carries the right edge in its *low* byte and the bottom edge in its
+        // high byte. Reading them the other way round produces bounds that are
+        // transposed - a pointer confined to a strip the width of the screen and
+        // one pixel tall - which looks like a mouse with a broken vertical axis.
+        this.host.mouse.setBounds?.(
+          Number(cpu.regs.read(Reg.CX) & 0xffffn),
+          Number(cpu.regs.read(Reg.DX) & 0xffffn),
+          Number(cpu.regs.read(Reg.BX) & 0xffn),
+          Number((cpu.regs.read(Reg.BX) >> 8n) & 0xffn),
+        );
+        return true;
+
+      case 0x0007: // set the speed divisor
+        this.host.mouse.setSpeed?.(Number(cpu.regs.read(Reg.CX) & 0xffffn));
+        return true;
+
+      case 0x000a: // set the graphics-mode cursor shape
+        // The mask and the mask-or are at ES:BX and ES:DX, 64 bytes each. This
+        // firmware keeps the hardware cursor hidden in graphics mode and lets the
+        // guest draw its own, which is what every real driver does; the bytes are
+        // still accepted so the driver's call succeeds.
+        return true;
+
+      case 0x000b: // set the horizontal bounds
+        this.host.mouse.setBounds?.(
+          Number(cpu.regs.read(Reg.BX) & 0xffffn),
+          0,
+          Number(cpu.regs.read(Reg.CX) & 0xffffn),
+          0,
+        );
+        return true;
+
+      case 0x000c: // set the vertical bounds
+        this.host.mouse.setBounds?.(
+          0,
+          Number(cpu.regs.read(Reg.BX) & 0xffffn),
+          0,
+          Number(cpu.regs.read(Reg.CX) & 0xffffn),
+        );
+        return true;
+
+      case 0x000f: // set the minimum speed
+      case 0x0010: // set the default speed
+      case 0x001a: // user-requested speed change
+        return true;
+
+      case 0x001b: // query the hardware's own settings
+        cpu.regs.write(Reg.BX, 0n);
+        return true;
+
+      case 0x001c: // user-requested driver swap
+      case 0x001f: // get the Y increment
+        this.host.mouse.setHardwareCursorVisible(false);
+        return true;
+
+      case 0x0021: // software driver reset
+      case 0x0024: // read the driver version
+        cpu.regs.write(Reg.BX, 0x0800n);
+        cpu.regs.write(Reg.CX, 0x0000n);
+        return true;
+
+      default:
+        // Unknown functions are refused rather than silently succeeding, except
+        // for the two that a driver calls to check whether it is talking to a
+        // mouse at all.
+        return this.mouseInitialised && function_ === 0x001d;
+    }
+  }
+
+  private mouseInitialised = false;
+
+  /** Fill BX/CX/DX from the pointer's current state, as `int 33h/0003` does. */
+  private mouseReturnState(): void {
+    const { cpu } = this.host;
+    const mouse = this.host.mouse;
+    cpu.regs.write(Reg.BX, BigInt(mouse.buttons & 0x07));
+    cpu.regs.write(Reg.CX, BigInt(mouse.x & 0xffff));
+    cpu.regs.write(Reg.DX, BigInt(mouse.y & 0xffff));
   }
 
   /* ------------------------------------------------------------------ */

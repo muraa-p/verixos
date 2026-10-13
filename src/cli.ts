@@ -22,6 +22,7 @@
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { spawn } from 'node:child_process';
 
 import { CpuMode, InstructionDecoder, bufferReader } from './arch/decode.ts';
 import { assemble } from './asm/index.ts';
@@ -29,6 +30,7 @@ import { formatRegisters } from './arch/registers.ts';
 import { hexDump } from './boot/index.ts';
 import { Machine } from './machine/machine.ts';
 import { Kernel } from './kernel/kernel.ts';
+import { createDesktopHost } from './host/server.ts';
 import { parseKeyScript } from './kernel/desktop.ts';
 import { encodePng } from '../tools/screenshot.ts';
 
@@ -383,6 +385,79 @@ function commandRun(args: Args): number {
   return machine.cpu.halted ? 0 : 1;
 }
 
+/**
+ * `verix desktop` - a live, clickable window.
+ *
+ * This is the interactive one. It boots the machine, shows the boot console for a
+ * moment, then serves the desktop to a browser over a local WebSocket and opens it.
+ * Every click and keystroke in that window goes through the same emulator a guest
+ * program sees: the mouse becomes PS/2 packets and IRQ12, the keyboard becomes
+ * set 1 scan codes, and the shell hit-tests them.
+ */
+function commandDesktop(args: Args): Promise<number> {
+  const fps = Math.max(1, flagNumber(args, 'fps', 30));
+  const bootHoldMs = Math.max(0, flagNumber(args, 'boot-hold', 1800));
+  const port = flagNumber(args, 'port', 0);
+  const noBrowser = args.flags.has('no-open');
+
+  const kernel = new Kernel();
+  const report = kernel.runBoot();
+  kernel.enableMouse();
+
+  const host = createDesktopHost({ kernel, fps, bootHoldMs, port });
+  host.showBootConsole();
+
+  process.stdout.write(`
+VerixOS desktop
+===============
+  boot    ${report.handedOff ? 'handed over' : 'FAILED'} in ${report.instructions} instructions
+  machine ${report.instructions} instructions, ${kernel.machine.bus.ram.sizeBytes / (1024 * 1024)} MiB
+  frame   ${320}x${200} at ${fps} fps
+
+  Click a dock icon, drag a title bar, right-click for a menu.
+  Ctrl+C here stops the machine; the browser window closes with it.
+
+`);
+
+  return new Promise<number>((resolve) => {
+    const shutdown = (code: number): void => {
+      void host.close().then(() => {
+        process.stdout.write('\nVerixOS stopped.\n');
+        resolve(code);
+      });
+    };
+
+    process.on('SIGINT', () => shutdown(0));
+    process.on('SIGTERM', () => shutdown(0));
+
+    void host.listen().then(() => {
+      process.stdout.write(`  open    ${host.url}\n\n`);
+      if (!noBrowser) openBrowser(host.url);
+    });
+  });
+}
+
+/**
+ * Open a URL in the user's browser.
+ *
+ * Best-effort by design: a machine with no browser, or a headless one, should still
+ * be able to run the desktop and read the URL printed above. Failing to launch a
+ * browser is therefore reported and ignored rather than fatal.
+ */
+function openBrowser(url: string): void {
+  try {
+    if (process.platform === 'win32') {
+      spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore' }).unref();
+    } else if (process.platform === 'darwin') {
+      spawn('open', [url], { detached: true, stdio: 'ignore' }).unref();
+    } else {
+      spawn('xdg-open', [url], { detached: true, stdio: 'ignore' }).unref();
+    }
+  } catch (error) {
+    process.stdout.write(`  (could not open a browser: ${(error as Error).message})\n`);
+  }
+}
+
 /* -------------------------------------------------------------------------- */
 /* Images                                                                       */
 /* -------------------------------------------------------------------------- */
@@ -422,7 +497,15 @@ function writePng(
 /* Entry point                                                                  */
 /* -------------------------------------------------------------------------- */
 
-function main(argv: readonly string[]): number {
+/**
+ * Run a command.
+ *
+ * Async because `desktop` only finishes when the machine is stopped, which happens
+ * on a signal rather than at the end of a function. Every other command resolves
+ * immediately, so awaiting the result uniformly costs nothing and avoids two
+ * different error-handling shapes.
+ */
+async function main(argv: readonly string[]): Promise<number> {
   const args = parseArgs(argv);
   try {
     switch (args.command) {
@@ -435,6 +518,9 @@ function main(argv: readonly string[]): number {
       case 'gui':
       case 'desktop':
         return commandGui(args);
+      case 'live':
+      case 'window':
+        return commandDesktop(args);
       case 'run':
         return commandRun(args);
       case 'screen':
@@ -476,4 +562,4 @@ function main(argv: readonly string[]): number {
   }
 }
 
-process.exitCode = main(process.argv.slice(2));
+process.exitCode = await main(process.argv.slice(2));

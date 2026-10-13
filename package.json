@@ -20,7 +20,8 @@
   "scripts": {
     "start": "node --experimental-strip-types --no-warnings src/cli.ts",
     "run": "node --experimental-strip-types --no-warnings src/cli.ts",
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && npm run copy-assets",
+    "copy-assets": "node --experimental-strip-types --no-warnings tools/copy-assets.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --experimental-strip-types --no-warnings --test tests/*.test.ts",
     "test:watch": "node --experimental-strip-types --no-warnings --test --watch tests/*.test.ts",

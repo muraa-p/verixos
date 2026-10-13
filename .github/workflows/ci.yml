@@ -160,6 +160,72 @@ jobs:
             exit 1
           fi
 
+  built-desktop:
+    name: the built binary serves a desktop
+    runs-on: ubuntu-latest
+    # tsc only emits .ts. The boot sector, stage 2 and the live desktop's client
+    # files are data that the runtime reads off disk, so a build that compiles and
+    # stops produces a dist that passes every unit test and then fails the first
+    # time somebody runs it. This job runs the built output, not the source.
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Boot from dist
+        run: node dist/src/cli.js boot --smoke
+
+      - name: Serve the desktop from dist and fetch it
+        run: |
+          set -euo pipefail
+          node dist/src/cli.js live --no-open --fps 15 > log.txt 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+
+          # Poll rather than sleeping a fixed time: CI machines vary, and a fixed
+          # sleep is either flaky or unnecessarily slow.
+          url=""
+          for _ in $(seq 1 60); do
+            url=$(grep -o 'http://127\.0\.0\.1:[0-9]*' log.txt | head -n 1 || true)
+            if [ -n "$url" ]; then break; fi
+            sleep 1
+          done
+          if [ -z "$url" ]; then
+            echo "::error::the desktop never printed a URL:"
+            cat log.txt
+            exit 1
+          fi
+
+          curl --fail --silent --show-error "$url/" | grep -q '<canvas'
+          curl --fail --silent --show-error "$url/client.js" | grep -q 'new WebSocket'
+          curl --fail --silent --show-error --output frame.png "$url/screenshot.png"
+          # The PNG signature, checked as bytes. A shell text check would pass on a
+          # response that is not a PNG at all.
+          if [ "$(head -c 4 frame.png | od -An -tx1 | tr -d ' \n')" != "89504e47" ]; then
+            echo "::error::the screenshot endpoint did not return a PNG"
+            exit 1
+          fi
+          echo "the built binary served a canvas, its script and a $url screenshot"
+
+      - name: Upload the frame the built binary produced
+        uses: actions/upload-artifact@v4
+        with:
+          name: built-desktop-frame
+          path: frame.png
+          if-no-files-found: error
+          retention-days: 7
+
   assets:
     name: docs assets are current
     runs-on: ubuntu-latest

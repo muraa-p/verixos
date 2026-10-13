@@ -35,6 +35,7 @@ import { MemoryBus } from './memory.ts';
 import { PortIoBus } from './io.ts';
 import { VgaAdapter, MODE_13H } from './devices/vga.ts';
 import { Ps2Keyboard } from './devices/keyboard.ts';
+import { Ps2Mouse } from './devices/mouse.ts';
 import { PicPair } from './devices/pic.ts';
 import { Pit8254 } from './devices/pit.ts';
 import { Uart16550 } from './devices/uart.ts';
@@ -43,6 +44,16 @@ import type { FirmwareHost } from './firmware.ts';
 
 /** PIT oscillator frequency, from the 8254 datasheet. */
 export const PIT_FREQUENCY = 1_193_182;
+
+/**
+ * The mouse's interrupt line.
+ *
+ * It is IRQ12 rather than anything in `types.ts`'s `IRQ` table because that table
+ * enumerates the master controller's eight lines; the mouse lives on the slave,
+ * where the numbering restarts at 8. Reaching it at all requires the master's
+ * cascade line to be unmasked, which is why raising it also unmasks IRQ2.
+ */
+const IRQ_MOUSE = 12;
 
 /**
  * Where the boot code hands control to the kernel.
@@ -89,6 +100,14 @@ export class Machine implements FirmwareHost {
   readonly cpu: Cpu;
   readonly vga = new VgaAdapter();
   readonly keyboard = new Ps2Keyboard();
+  /**
+   * The PS/2 mouse, on the controller's auxiliary port.
+   *
+   * It is a separate device from the keyboard because it is a separate thing on
+   * the other end of port 0x64 - but it shares the 8042's single data register,
+   * which is why `keyboard.aux` exists and why the mouse has no ports of its own.
+   */
+  readonly mouse = new Ps2Mouse();
   readonly pit = new Pit8254();
   readonly pic: PicPair;
   readonly uart: Uart16550;
@@ -166,6 +185,8 @@ export class Machine implements FirmwareHost {
 
     this.io.register(this.vga);
     this.io.register(this.keyboard);
+    // The mouse has no ports of its own: the 8042 at 0x60/0x64 multiplexes it.
+    this.keyboard.aux = this.mouse;
     this.io.register(this.pit);
     this.io.register(this.pic.master);
     this.io.register(this.pic.slave);
@@ -201,6 +222,31 @@ export class Machine implements FirmwareHost {
   }
 
   private lastScanCodesGenerated = 0;
+
+  private lastMousePackets = 0;
+
+  /**
+   * Raise IRQ12 when the mouse has produced a packet.
+   *
+   * IRQ12 is on the *slave* PIC, which is only visible through the master's
+   * cascade on IRQ2. So raising it needs the cascade unmasked as well, or the
+   * request is latched in the slave and never delivered - a mouse that moves and
+   * never interrupts, which is the same symptom as a mouse that does not move.
+   */
+  private raiseMouseIrqIfNeeded(): void {
+    const packets = this.mouse.state.packets;
+    if (packets === this.lastMousePackets) return;
+    this.lastMousePackets = packets;
+    this.pic.unmask(2);
+    this.pic.raise(IRQ_MOUSE);
+  }
+
+
+  /** Unmask the mouse's line, and the cascade that makes it reachable. */
+  enableMouseIrq(): void {
+    this.pic.unmask(2);
+    this.pic.unmask(IRQ_MOUSE);
+  }
 
   /* ------------------------------------------------------------------ */
   /* Loading                                                             */
@@ -245,6 +291,7 @@ export class Machine implements FirmwareHost {
     // though it were a character.
     this.firmware.primeKeyboard();
     this.firmware.syncBiosDataArea();
+    this.mouse.setScreenSize(this.vga.currentMode.hres, this.vga.currentMode.vres);
   }
 
   /* ------------------------------------------------------------------ */
@@ -324,6 +371,7 @@ export class Machine implements FirmwareHost {
    */
   tick(): Instruction | undefined {
     this.raiseKeyboardIrqIfNeeded();
+    this.raiseMouseIrqIfNeeded();
     this.serviceInterrupts();
     if (this.cpu.halted) return undefined;
     const instruction = this.step();
@@ -396,6 +444,7 @@ export class Machine implements FirmwareHost {
   advanceTime(oscillatorCycles: number): void {
     for (let i = 0; i < 4; i++) {
       this.raiseKeyboardIrqIfNeeded();
+      this.raiseMouseIrqIfNeeded();
       this.serviceInterrupts();
       this.pit.advance(Math.ceil(oscillatorCycles / 4));
     }
@@ -442,6 +491,9 @@ export class Machine implements FirmwareHost {
   enterGraphicsMode(): void {
     this.vga.setMode(MODE_13H);
     this.firmware.syncBiosDataArea();
+    // The mouse cannot know how large the screen is, and a BIOS call that passes
+    // zero for the maximum is asking it to guess.
+    this.mouse.setScreenSize(this.vga.currentMode.hres, this.vga.currentMode.vres);
   }
 
   /** Unmask the timer and keyboard lines, which is what `sti`-ing a driver means. */

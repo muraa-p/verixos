@@ -11,6 +11,64 @@ not guaranteed.
 
 ## [Unreleased]
 
+### The desktop is a window you can click
+
+`npm start -- live` boots the machine, shows the text-mode boot console, then serves
+the desktop over a local WebSocket and opens it in a browser. You can move the
+pointer, click dock icons, drag windows by their title bars, double-click to
+maximise, right-click for a context menu, scroll the terminal and type into it.
+
+Everything a click goes through is modelled rather than faked. The pointer is a
+**PS/2 mouse** on the 8042's auxiliary port; its motion becomes a three- or
+four-byte packet with the sign in byte 0, raises IRQ12 through the master's cascade,
+and is read back through `int 33h`. Keystrokes are set 1 scan codes, so a guest's
+own translation is exercised rather than bypassed.
+
+The host is a browser rather than a native window because a native window would
+need a GUI toolkit — a native dependency, a build step, and three different ones
+per platform — and this project commits to zero runtime dependencies and "clone it
+and run it". The frame buffer goes out as palette indices, which is what the
+adapter actually holds: 64 000 bytes per frame instead of 256 000.
+
+### Fixed
+
+- **The kernel-drawn pointer left a permanent smear.** The back buffer is never
+  cleared between frames, so the pixels a cursor painted survived every subsequent
+  frame; damaging the rectangle the pointer had left was not enough, because
+  damaged only means "copy this region to the front buffer". `CursorBuffer` now
+  saves and restores the pixels beneath it, and a test asserts that a pixel covered
+  by the pointer returns to exactly the colour it had.
+- **A maximised window had no title bar.** Maximising inset the window by an
+  arbitrary two pixels, which put its title bar *behind* the top bar. Such a
+  window could not be dragged and could not be un-maximised by double-clicking it.
+  The inset is now the frame's own height.
+- **Clicking the desktop focused the last window instead of nothing.**
+  `setFocus(-1)` wrapped through the window list, so "no window has focus" became
+  "the window at the end of the list". Clearing focus and cycling focus are now
+  separate operations.
+- **`int 33h/0006` transposed the pointer bounds.** The right edge is in `BX`'s low
+  byte and the bottom edge in its high byte; reading them the other way round
+  confines the pointer to a strip one pixel tall.
+- **`int 33h/0005` hid the middle button**, masking the button state to two bits.
+- **The 8042's status bit 5 was set after the byte was read**, not before, so a
+  polling guest could not tell a motion packet from a scancode until it had already
+  read the wrong one. It now describes the byte that is *waiting*.
+- **A `0xD4` prefix covered only one byte**, so the parameter of a parameterised
+  mouse command — setting a resolution, for instance — was delivered to the
+  keyboard and the mouse kept its default.
+- **The PS/2 resolution parameter was inverted**: value 0, the coarsest setting,
+  was read as the finest.
+- **The mouse's acknowledgement came after its first motion packet**, so a driver
+  reading one byte in answer to `0xF4` consumed a packet's flags byte as though it
+  were the reply.
+- **`int 33h/0004` did nothing.** The firmware called `setPosition` and the device
+  exposed `moveTo`; the call was optional, so it was silently skipped.
+- **The built `dist` could not boot.** `tsc` emits only `.ts`, and the boot sector,
+  stage 2 and the desktop's client files are read off disk at runtime. A build that
+  compiled and stopped produced a `dist` that passed every unit test and then
+  failed with `ENOENT` on first run. `npm run build` now copies them, and a CI job
+  runs the built output rather than the source.
+
 ### The system boots, and there is a desktop
 
 The largest change since the assembler landed: machine code is now executed. A

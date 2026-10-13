@@ -197,6 +197,65 @@ get report(): BootReport | undefined {
     return this.desktop.press(event);
   }
 
+  /* ------------------------------------------------------------------ */
+  /* Pointer                                                             */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * The pointer's position in desktop pixels, clamped to the screen.
+   *
+   * Two different coordinate systems meet here. The host's window is whatever size
+   * the browser is; the desktop is 320x200 fixed. Scaling the pointer up by the
+   * same integer factor the display uses keeps the two aligned, and clamping after
+   * scaling stops a pointer dragged past the edge of the window from reporting a
+   * position outside the screen.
+   */
+  movePointer(x: number, y: number, scale: number): void {
+    const desktop = this.desktop;
+    desktop.input.move(
+      Math.round(x / Math.max(1, scale)),
+      Math.round(y / Math.max(1, scale)),
+    );
+  }
+
+  /** A mouse button changed. `button` is 0 left, 1 middle, 2 right. */
+  pointerButton(button: number, down: boolean, nowMs: number): void {
+    if (down) this.desktop.input.press(button, nowMs);
+    else this.desktop.input.release(button);
+  }
+
+  /** The wheel turned; `notches` is positive for away from the user. */
+  pointerWheel(notches: number): void {
+    this.desktop.input.wheel(notches);
+  }
+
+  /** Feed a scan code to the emulated keyboard controller, as a guest expects. */
+  pressScanCode(code: number, extended = false): void {
+    if (extended) this.machine.keyboard.press(0xe0);
+    this.machine.keyboard.press(code);
+  }
+
+  releaseScanCode(code: number, extended = false): void {
+    this.machine.keyboard.release(code);
+    if (extended) this.machine.keyboard.release(0xe0);
+  }
+
+  /** Enable the mouse's interrupt line and the cascade that carries it. */
+  enableMouse(): void {
+    this.machine.enableMouseIrq();
+  }
+
+  /**
+   * Put the desktop back the way it started.
+   *
+   * A "reset" that left a dragged window where the user dropped it, a menu open and
+   * a window maximised would not be a reset - it would be a partial reload with the
+   * same name, and the difference is obvious the second time someone uses it.
+   */
+  resetDesktop(): void {
+    this.desktop.reset();
+  }
+
   /** The adapter's pixels, as 0xRRGGBB. This is what a screenshot is. */
   pixels(): Uint32Array {
     return this.machine.vga.renderToRgb();

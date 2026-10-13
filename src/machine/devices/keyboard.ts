@@ -194,6 +194,32 @@ export interface KeyEvent {
   readonly extended: boolean;
 }
 
+/**
+ * What the controller needs from the device on its auxiliary port.
+ *
+ * Deliberately narrow: the mouse never answers a port read itself. It hands over
+ * bytes when it has them, and the controller decides which of them the guest gets,
+ * because the output buffer holds one byte and both devices share it.
+ */
+export interface AuxPort {
+  /** True when a byte is waiting. */
+  readonly hasData: boolean;
+  /** Take the oldest byte. */
+  readData(): number | undefined;
+  /** The most recent byte transferred, echoed when the buffer is empty. */
+  readonly lastTransferredByte: number;
+  /**
+   * True while a command is still waiting for its parameter byte.
+   *
+   * Without this the controller cannot tell "the guest is sending the mouse's
+   * resolution" from "the guest has finished and is talking to the keyboard", and
+   * the second byte of every parameterised mouse command goes to the wrong device.
+   */
+  readonly wantsMoreInput: boolean;
+  /** Handle a byte the guest wrote after a `0xD4` prefix. */
+  command(value: number): void;
+}
+
 export class Ps2Keyboard {
   readonly name = 'ps2-keyboard';
   readonly startPort = 0x60;
@@ -229,6 +255,32 @@ export class Ps2Keyboard {
 
   /** Number of scan codes generated, for diagnostics. */
   scanCodesGenerated = 0;
+
+  /**
+   * The mouse on the auxiliary port, wired by the machine.
+   *
+   * The 8042 is one chip with two ports, and the keyboard and the mouse share its
+   * single data register at 0x60 and single command register at 0x64. Routing is
+   * therefore a property of the *controller*, which is what this class is, rather
+   * than of either device - so the mouse is held here and the class routes to it
+   * rather than each device pretending to own the ports.
+   */
+  aux: AuxPort | undefined;
+
+  /**
+   * True when the auxiliary clock is enabled, i.e. when the mouse may talk.
+   *
+   * A guest disables it with 0xA7 and re-enables with 0xA8. A mouse that ignores
+   * this keeps reporting into a controller that is not listening, and the guest
+   * sees packets arrive for a device it has switched off.
+   */
+  private auxClockEnabled = true;
+
+  /** Set by a `0xD4` command; the next write to 0x60 is destined for the mouse. */
+  private pendingAuxWrite = false;
+
+  /** Byte most recently transferred on 0x60, echoed when the buffer is empty. */
+  private lastTransferred = 0;
 
   constructor() {
     this.outputBuffer.push(...DEFAULT_KEYBOARD_ID);
@@ -299,9 +351,16 @@ export class Ps2Keyboard {
     }
   }
 
-  /** True when a byte is waiting at port 0x60. */
+  /**
+   * True when a byte is waiting at port 0x60, from either device.
+   *
+   * The output buffer belongs to the controller, so a byte queued by the mouse
+   * counts just as much as one queued by the keyboard. A guest polling this bit
+   * is asking "is there anything to read", not "did the keyboard say something".
+   */
   get dataAvailable(): boolean {
-    return this.outputBuffer.length > 0;
+    if (this.outputBuffer.length > 0) return true;
+    return this.auxClockEnabled && this.aux?.hasData === true;
   }
 
   /** True when the last modifier state included any form of shift. */
@@ -321,16 +380,62 @@ export class Ps2Keyboard {
     return this.leds;
   }
 
+  /**
+   * True when the byte the next read of 0x60 will return came from the mouse.
+   *
+   * The controller prefers its own queued bytes, so this holds only when the
+   * keyboard's buffer is empty and the mouse has something waiting. It has to be
+   * answerable *before* the read: a guest polls bit 5 to learn whether the byte it
+   * is about to take is a scancode or a motion packet, and a status bit that only
+   * becomes correct afterwards tells it nothing it can act on.
+   */
+  private nextByteIsFromAux(): boolean {
+    return this.outputBuffer.length === 0 && this.auxClockEnabled && this.aux?.hasData === true;
+  }
+
+  /** Keep bit 0 honest about the controller's one-byte output buffer. */
+  private refreshOutputBufferFlag(): void {
+    if (this.outputBuffer.length > 0 || this.nextByteIsFromAux()) {
+      this.status |= Ps2Status.OUTPUT_BUFFER_FULL;
+    } else {
+      this.status &= ~Ps2Status.OUTPUT_BUFFER_FULL;
+    }
+  }
+
   portRead(offset: number): bigint {
     if (offset === 0) {
-      // Data port. Consume the oldest queued byte.
-      const byte = this.outputBuffer.shift();
-      if (byte === undefined) return 0n;
-      if (this.outputBuffer.length === 0) {
-        this.status &= ~Ps2Status.OUTPUT_BUFFER_FULL;
+      // Data port. The keyboard's own bytes win, because a queued keystroke that
+      // arrives before the mouse's next motion packet is the more urgent of the
+      // two and a guest that read them in the other order would see typing
+      // arrive after the click that preceded it.
+      const own = this.outputBuffer.shift();
+      const fromAux = own === undefined && this.auxClockEnabled ? this.aux?.readData() : undefined;
+      const byte = own ?? fromAux;
+      if (byte === undefined) {
+        // An empty output buffer makes a real 8042 return the byte most recently
+        // transferred rather than zero. Guests poll, and a zero is indistinguishable
+        // from a legitimate answer.
+        return BigInt(this.lastTransferred);
       }
+      this.lastTransferred = byte & 0xff;
+      if (own === undefined) this.status |= Ps2Status.AUX_DATA;
+      else this.status &= ~Ps2Status.AUX_DATA;
+      this.refreshOutputBufferFlag();
       return BigInt(byte);
     }
+
+    // The buffer flags are refreshed *first*, so the value returned describes the
+    // state as it is now rather than as it was before this method decided what
+    // that state is.
+    this.refreshOutputBufferFlag();
+    // Bit 5 describes the byte that is waiting, not the byte that was last taken.
+    // Setting it only on the way out leaves a polling driver unable to tell the
+    // two devices apart until after it has already read the wrong one. With
+    // nothing pending it is cleared: a guest looping on the status port would
+    // otherwise go on seeing "from the mouse" after the mouse has gone quiet, and
+    // read a stale byte as if it were a fresh packet.
+    if (this.nextByteIsFromAux()) this.status |= Ps2Status.AUX_DATA;
+    else this.status &= ~Ps2Status.AUX_DATA;
 
     // Status port: reflect the real state of the buffers.
     let value = this.status & ~(Ps2Status.INPUT_BUFFER_FULL | Ps2Status.INPUT_BUFFER_COMMAND);
@@ -344,7 +449,18 @@ export class Ps2Keyboard {
   portWrite(offset: number, _widthBytes: number, raw: bigint): void {
     const value = Number(raw & 0xffn);
     if (offset === 0) {
-      // Data port: a command for the keyboard.
+      // Data port. A `0xD4` to the command port has already decided where this goes,
+      // which is the only way one register can serve two devices. The prefix covers
+      // the command *and its parameters*: a guest sets a resolution with one `0xD4`,
+      // a command byte and a parameter byte, and consuming only the first would send
+      // the parameter to the keyboard, which acknowledges it and leaves the mouse at
+      // its default - a mouse that ignores every setting it is given.
+      if (this.pendingAuxWrite || this.aux?.wantsMoreInput === true) {
+        this.pendingAuxWrite = false;
+        if (this.auxClockEnabled) this.aux?.command(value);
+        return;
+      }
+      // Otherwise: a command for the keyboard.
       this.inputBuffer.push(value);
       this.hasPendingInput = true;
       this.status |= Ps2Status.INPUT_BUFFER_FULL;
@@ -372,10 +488,24 @@ export class Ps2Keyboard {
         break;
       case Ps2Command.WRITE_INTERFACE_CONFIG:
         break;
+      case Ps2Command.WRITE_SECOND_OB_INPUT:
+        // The next byte written to 0x60 goes to the mouse instead of the keyboard.
+        // Nothing else changes, which is why the flag is the whole of it - and why
+        // getting this wrong silently sends every mouse command to the keyboard,
+        // which acknowledges them all and looks like a mouse that responds but
+        // never moves.
+        this.pendingAuxWrite = true;
+        break;
       case Ps2Command.DISABLE_SECOND_PORT:
+        // 0xA7 gates the auxiliary clock. A mouse that keeps talking anyway
+        // delivers packets for a device the guest believes it has switched off,
+        // and the guest's first move after disabling it is usually to drain the
+        // buffer - which then never empties.
+        this.auxClockEnabled = false;
         this.status |= Ps2Status.KEYBOARD_INHIBIT;
         break;
       case Ps2Command.ENABLE_SECOND_PORT:
+        this.auxClockEnabled = true;
         this.status &= ~Ps2Status.KEYBOARD_INHIBIT;
         break;
       default:

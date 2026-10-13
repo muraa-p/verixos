@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>VerixOS</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --chrome: #0d1117;
+        --edge: #222b38;
+        --muted: #8593a6;
+        --accent: #35e0d0;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: var(--chrome);
+        color: #d6dde8;
+        font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        overflow: hidden;
+      }
+      body { display: flex; flex-direction: column; }
+
+      header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 6px 12px;
+        border-bottom: 1px solid var(--edge);
+        flex: 0 0 auto;
+        user-select: none;
+      }
+      header .name { color: var(--accent); letter-spacing: 0.08em; }
+      header .status { color: var(--muted); }
+      header .spacer { flex: 1; }
+      header button {
+        background: #161c26;
+        color: #d6dde8;
+        border: 1px solid var(--edge);
+        border-radius: 3px;
+        padding: 3px 10px;
+        cursor: pointer;
+        font: inherit;
+      }
+      header button:hover { border-color: var(--accent); color: var(--accent); }
+
+      /* The screen fills whatever space is left, and the canvas is scaled by a
+         whole number so a pixel stays square. Non-integer scaling would make a
+         1-pixel border into a smeared one, which is the difference between a
+         window that looks drawn and one that looks like a photograph of one. */
+      #screen {
+        flex: 1 1 auto;
+        display: grid;
+        place-items: center;
+        min-height: 0;
+      }
+      canvas {
+        image-rendering: pixelated;
+        image-rendering: crisp-edges;
+        display: block;
+        cursor: none;
+        outline: none;
+        box-shadow: 0 0 0 1px var(--edge), 0 18px 60px rgba(0, 0, 0, 0.55);
+      }
+      footer {
+        flex: 0 0 auto;
+        padding: 5px 12px;
+        border-top: 1px solid var(--edge);
+        color: var(--muted);
+        display: flex;
+        gap: 18px;
+        flex-wrap: wrap;
+        user-select: none;
+      }
+      footer b { color: #d6dde8; font-weight: 500; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <span class="name">VERIX</span>
+      <span class="status" id="status">connecting</span>
+      <span class="spacer"></span>
+      <button id="reset" type="button">Reset</button>
+      <button id="shot" type="button">Screenshot</button>
+      <button id="focus" type="button">Focus desktop</button>
+    </header>
+
+    <div id="screen"><canvas id="canvas" tabindex="0" width="320" height="200"></canvas></div>
+
+    <footer>
+      <span><b>Click</b> an icon to open it</span>
+      <span><b>Drag</b> a title bar to move a window</span>
+      <span><b>Double-click</b> a title bar to maximise</span>
+      <span><b>Right-click</b> for a menu</span>
+      <span><b>Wheel</b> scrolls the terminal</span>
+      <span><b>Tab</b> <b>Enter</b> <b>Esc</b> <b>F1</b> also work</span>
+    </footer>
+
+    <script src="/client.js"></script>
+  </body>
+</html>

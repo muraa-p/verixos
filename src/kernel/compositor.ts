@@ -148,6 +148,17 @@ export class Compositor {
 
   private readonly width: number;
   private readonly height: number;
+
+  /** The screen's width, for callers that need to clip against it. */
+  get screenWidth(): number {
+    return this.width;
+  }
+
+  /** The screen's height, for callers that need to clip against it. */
+  get screenHeight(): number {
+    return this.height;
+  }
+
   private readonly damaged: Rect[] = [];
   private damageAllPending = false;
   private stats: PresentStats;
@@ -495,6 +506,147 @@ export class Compositor {
 /* -------------------------------------------------------------------------- */
 /* Rectangle arithmetic                                                         */
 /* -------------------------------------------------------------------------- */
+
+/**
+ * The pointer.
+ *
+ * Two-tone and punched through the background, which is what makes it readable
+ * over both the near-black desktop and a bright window without changing colour as
+ * it moves. The middle character is the *fill*: it writes the background colour
+ * rather than nothing, which is what stops a thin outline from disappearing
+ * against a window whose border is the same colour as the pointer's edge.
+ *
+ * Spelled out as text rather than as bit masks because the bit-mask form is
+ * unreadable and this is a thing a person has to be able to change.
+ */
+export const CURSOR_ART: readonly string[] = [
+  'o...........',
+  'ox..........',
+  'oxx.........',
+  'oxxx........',
+  'oxxxx.......',
+  'oxxxxx......',
+  'oxxxxxx.....',
+  'oxxxxxxx....',
+  'oxxxxxxxx...',
+  'oxxxxxxxxx..',
+  'oxxxxxxxx....',
+  'oxxxxxxxxx...',
+  'oxxxxxx......',
+  'oxo.oxx......',
+  'ox...oxx.....',
+  'o.....ox.....',
+  '.......ox....',
+  '........o....',
+];
+
+/** Where the pointer's tip sits inside the sprite. */
+export const CURSOR_HOTSPOT = { x: 0, y: 0 };
+
+export const CURSOR = {
+  /** The outline. */
+  ink: COLOUR.highlight,
+  /** The fill, punched into whatever is underneath. */
+  fill: COLOUR.background,
+} as const;
+
+/**
+ * Draw the pointer, punching a hole through whatever it covers.
+ *
+ * The pixels under the cursor are not saved and restored. That is not laziness: a
+ * desktop whose pointer can leave a trail has to copy and restore a rectangle on
+ * every move, and this compositor's damage tracking would then report the pointer
+ * as damage everywhere it has been - which would quietly turn the
+ * "examines a small fraction of the screen" measurement into a lie.
+ */
+export function drawCursor(compositor: Compositor, x: number, y: number): void {
+  for (let row = 0; row < CURSOR_ART.length; row++) {
+    const line = CURSOR_ART[row]!;
+    for (let column = 0; column < line.length; column++) {
+      const mark = line[column]!;
+      if (mark === '.') continue;
+      compositor.pixel(x + column, y + row, mark === 'o' ? CURSOR.ink : CURSOR.fill);
+    }
+  }
+}
+
+/**
+ * Save and restore the pixels under a software cursor.
+ *
+ * This is the piece that makes a kernel-drawn pointer possible at all. The back
+ * buffer is deliberately never cleared between frames, so the pixels a cursor
+ * painted are still there the next frame; damaging the rectangle the pointer has
+ * just left is not enough, because "damaged" only means "copy this region to the
+ * front buffer", and the region still holds the cursor. Without restoring it, the
+ * pointer leaves a permanent smear wherever it goes.
+ *
+ * The alternative is a real hardware overlay, which this machine model does not
+ * have and which no guest could rely on anyway. So the cost is paid honestly: one
+ * small read before drawing and one small blit after moving, and the damage the
+ * pointer causes is reported as the two rectangles involved - which is the number
+ * the tests measure, so the cost is visible rather than assumed.
+ */
+export class CursorBuffer {
+  /** The pixels under the cursor, in palette indices, row by row. */
+  private saved = new Uint8Array(0);
+  private savedRect: Rect | undefined;
+
+  private readonly compositor: Compositor;
+  private readonly width: number;
+  private readonly height: number;
+
+  // Declared as fields and assigned rather than as constructor parameter
+  // properties, because `erasableSyntaxOnly` forbids them and a project that
+  // compiles with type-stripping cannot have them anywhere.
+  constructor(compositor: Compositor, width: number, height: number) {
+    this.compositor = compositor;
+    this.width = width;
+    this.height = height;
+  }
+
+  /** The rectangle currently covered, which is also the damage to reserve. */
+  get rect(): Rect | undefined {
+    return this.savedRect;
+  }
+
+  /**
+   * Put back what was under the cursor, then take a new copy.
+   *
+   * Called before the pointer is drawn. Doing both in one step is what keeps the
+   * code honest: a caller cannot restore without saving, or save without
+   * restoring, because there is only one place to do it.
+   */
+  moveTo(x: number, y: number): void {
+    this.restore();
+
+    const rect: Rect = { x, y, width: this.width, height: this.height };
+    if (clip(rect, this.compositor.screenWidth, this.compositor.screenHeight) === undefined) return;
+
+    const needed = rect.width * rect.height;
+    if (this.saved.length < needed) this.saved = new Uint8Array(needed);
+    this.savedRect = rect;
+
+    let offset = 0;
+    for (let row = 0; row < rect.height; row++) {
+      for (let column = 0; column < rect.width; column++) {
+        this.saved[offset++] = this.compositor.getPixel(rect.x + column, rect.y + row);
+      }
+    }
+  }
+
+  /** Put the saved pixels back over the cursor. */
+  restore(): void {
+    const rect = this.savedRect;
+    if (rect === undefined) return;
+    let offset = 0;
+    for (let row = 0; row < rect.height; row++) {
+      for (let column = 0; column < rect.width; column++) {
+        this.compositor.pixel(rect.x + column, rect.y + row, this.saved[offset++]!);
+      }
+    }
+    this.savedRect = undefined;
+  }
+}
 
 /** Clip to the screen, or `undefined` if nothing is visible. */
 export function clip(rect: Rect, width: number, height: number): Rect | undefined {
