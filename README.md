@@ -189,14 +189,18 @@ the measured cost of each frame, and typing goes to the window that has focus.
 ### Try it
 
 ```text
-$ npm start boot                      # run the boot sequence, print what it did
-$ npm start gui --frames 120 --out out   # render frames to PNG
-$ npm start gui --keys "Tab/type:ver/Enter" --check   # assert it responds
-$ npm start run examples/hello.asm --trace            # assemble, execute, trace
+$ npm start boot                              # run the boot sequence, print what it did
+$ npm start -- gui --frames 120 --out out     # render frames to PNG
+$ npm start -- gui --keys "Tab/type:ver/Enter" --check
+$ npm start -- run examples/hello.asm --trace
 ```
 
-`npm start gui --check` is the testable form of the whole thing. It exits non-zero
-unless every frame drew something, the boot handed over, and no frame was idle.
+The `--` matters: `npm start gui --frames 120` does not work, because npm claims
+`--frames` as one of its own configuration options before the script ever sees it.
+
+`npm start -- gui --check` is the testable form of the whole thing. It exits
+non-zero unless the boot handed over, every frame drew something, and no frame
+was idle.
 
 ### Is it actually efficient?
 

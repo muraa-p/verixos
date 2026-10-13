@@ -87,6 +87,25 @@ function flagNumber(args: Args, name: string, fallback: number): number {
   return value;
 }
 
+/**
+ * Parse an address, accepting hex with or without the `0x`.
+ *
+ * `BigInt('7c00')` throws, and `--origin` is documented as hex, so taking it
+ * literally would make the documented form the one that fails. Everything the
+ * assembler and the machine use is an address, so every address flag goes through
+ * here rather than each re-deciding whether its input is hex.
+ */
+function flagAddress(args: Args, name: string, fallback: bigint): bigint {
+  const raw = args.flags.get(name);
+  if (raw === undefined) return fallback;
+  const text = raw.trim().toLowerCase();
+  const digits = text.startsWith('0x') ? text.slice(2) : text;
+  if (!/^[0-9a-f]+$/.test(digits)) {
+    throw new Error(`--${name} needs a hexadecimal address, got '${raw}'`);
+  }
+  return BigInt(`0x${digits}`);
+}
+
 /* -------------------------------------------------------------------------- */
 /* Output                                                                       */
 /* -------------------------------------------------------------------------- */
@@ -103,12 +122,18 @@ function commandHelp(): number {
   process.stdout.write(`
 VerixOS - an operating system you can run, look at and test without installing anything
 
-  verix boot                      Run the boot sequence and print what it did
-  verix gui [options]             Boot, then run the desktop and write PNG frames
-  verix run <file.asm> [options]  Assemble a program, execute it, print the result
-  verix screen                    Print the text-mode console
-  verix info                      Describe the machine
-  verix help                      This message
+  verix boot [options]          Run the boot sequence and print what it did
+  verix gui [options]           Boot, then run the desktop and report frame costs
+  verix run <file.asm> [opts]   Assemble a program, execute it, print the result
+  verix screen                  Print the text-mode console
+  verix info                    Describe the machine
+  verix help                    This message
+
+  Through npm, put '--' before the flags: 'npm start -- gui --frames 60'.
+  npm claims '--frames' as its own configuration option otherwise.
+
+boot options:
+  --smoke           One line of output and an exit code, for CI
 
 gui options:
   --frames <n>     Frames to render (default 120)
@@ -305,7 +330,7 @@ function commandRun(args: Args): number {
   }
   const source = readFileSync(path, 'utf8');
   const steps = Math.max(1, flagNumber(args, 'steps', 100_000));
-  const origin = BigInt(args.flags.get('origin') ?? '7c00');
+  const origin = flagAddress(args, 'origin', 0x7c00n);
   const modeName = (args.flags.get('mode') ?? 'real16').toLowerCase();
   const mode =
     modeName === 'long64' ? CpuMode.LONG64 : modeName === 'protected32' ? CpuMode.PROTECTED32 : CpuMode.REAL16;
